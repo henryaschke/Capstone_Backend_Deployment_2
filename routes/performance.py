@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Query, HTTPException
-from typing import Dict, Any, Optional
+from fastapi import APIRouter, Query, HTTPException, Depends
+from typing import Dict, Any, Optional, List
 import logging
 from datetime import datetime, timedelta
 
-from dependencies import DEFAULT_USER_ID, parse_date_string
+from dependencies import get_optional_user, DEFAULT_USER_ID, parse_date_string
 from database import get_performance_metrics
 
 # Configure logging
@@ -16,12 +16,17 @@ router = APIRouter()
 async def get_performance_metrics_api(
     start_date: str = Query(None),
     end_date: str = Query(None),
-    user_id: int = DEFAULT_USER_ID
+    user_id: int = Depends(get_optional_user)
 ):
-    """Get performance metrics for the user."""
+    """Get performance metrics for a user."""
     try:
+        # Use provided user_id or fallback to default
+        if user_id is None:
+            user_id = DEFAULT_USER_ID
+            
         start_date_obj = parse_date_string(start_date)
         end_date_obj = parse_date_string(end_date)
+        
         metrics = get_performance_metrics(user_id, start_date_obj, end_date_obj)
         
         # Generate some dummy chart data for demonstration

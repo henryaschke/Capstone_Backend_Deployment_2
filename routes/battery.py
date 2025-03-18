@@ -5,7 +5,7 @@ import logging
 
 from models.battery import BatteryStatus, BatteryAction
 from dependencies import get_optional_user, DEFAULT_USER_ID
-from database import get_battery_status, create_trade
+from database import get_battery_status, create_trade, update_battery_level, create_battery_if_not_exists
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -22,12 +22,20 @@ async def get_battery_status_api(
     try:
         battery = get_battery_status(user_id)
         if battery:
+            # Check for different field name conventions (camelCase vs snake_case)
+            current_level = battery.get("current_level", battery.get("Current_Level", 50.0))
+            total_capacity = battery.get("total_capacity", battery.get("Total_Capacity", 2.5))
+            usable_capacity = battery.get("usable_capacity", battery.get("Usable_Capacity", 2.0))
+            
+            # Log the battery status for debugging
+            logger.info(f"Battery status for user {user_id}: {battery}")
+            
             return {
-                "level": battery.get("current_level", 50.0),
+                "level": current_level,
                 "capacity": {
-                    "total": battery.get("total_capacity", 2.5),
-                    "usable": battery.get("usable_capacity", 2.0),
-                    "percentage": battery.get("current_level", 50.0)
+                    "total": total_capacity,
+                    "usable": usable_capacity,
+                    "percentage": current_level
                 }
             }
         else:
@@ -82,28 +90,33 @@ async def charge_battery(
     try:
         battery = get_battery_status(user_id)
         if not battery:
-            battery = {
-                "user_id": user_id,
-                "current_level": 50.0,
-                "total_capacity": 2.5,
-                "usable_capacity": 2.0
-            }
+            battery = create_battery_if_not_exists(user_id)
+            if not battery:
+                return {"success": False, "message": "Failed to create battery"}
         
-        current_level = battery.get("current_level", 50.0)
+        current_level = battery.get("current_level", battery.get("Current_Level", 50.0))
         new_level = current_level + request.quantity
+        
+        # Cap at 100%
         if new_level > 100:
             new_level = 100
         
-        # Optionally update in the database
-        # For demonstration, we just create a "charge" trade
+        # Update the battery level in the database
+        update_success = update_battery_level(user_id, new_level)
+        if not update_success:
+            logger.error(f"Failed to update battery level for user {user_id}")
+            return {"success": False, "message": "Failed to update battery level"}
+        
+        # Create a "charge" trade record
         trade_data = {
-            "user_id": user_id,
-            "market": "Battery",
-            "trade_type": "charge",
-            "quantity": request.quantity,
-            "trade_price": 0,
-            "timestamp": datetime.now(),
-            "status": "executed"
+            "Trade_ID": int(datetime.now().timestamp() * 1000),
+            "User_ID": user_id,
+            "Market": "Battery",
+            "Trade_Type": "charge",
+            "Quantity": request.quantity,
+            "Trade_Price": 0,
+            "Timestamp": datetime.now(),
+            "Status": "executed"
         }
         create_trade(trade_data)
         
@@ -122,26 +135,33 @@ async def discharge_battery(
     try:
         battery = get_battery_status(user_id)
         if not battery:
-            battery = {
-                "user_id": user_id,
-                "current_level": 50.0,
-                "total_capacity": 2.5,
-                "usable_capacity": 2.0
-            }
+            battery = create_battery_if_not_exists(user_id)
+            if not battery:
+                return {"success": False, "message": "Failed to create battery"}
         
-        current_level = battery.get("current_level", 50.0)
+        current_level = battery.get("current_level", battery.get("Current_Level", 50.0))
         new_level = current_level - request.quantity
+        
+        # Cap at 0%
         if new_level < 0:
             new_level = 0
         
+        # Update the battery level in the database
+        update_success = update_battery_level(user_id, new_level)
+        if not update_success:
+            logger.error(f"Failed to update battery level for user {user_id}")
+            return {"success": False, "message": "Failed to update battery level"}
+        
+        # Create a "discharge" trade record
         trade_data = {
-            "user_id": user_id,
-            "market": "Battery",
-            "trade_type": "discharge",
-            "quantity": request.quantity,
-            "trade_price": 0,
-            "timestamp": datetime.now(),
-            "status": "executed"
+            "Trade_ID": int(datetime.now().timestamp() * 1000),
+            "User_ID": user_id,
+            "Market": "Battery",
+            "Trade_Type": "discharge",
+            "Quantity": request.quantity,
+            "Trade_Price": 0,
+            "Timestamp": datetime.now(),
+            "Status": "executed"
         }
         create_trade(trade_data)
         

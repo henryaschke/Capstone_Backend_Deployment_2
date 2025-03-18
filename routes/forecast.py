@@ -1,12 +1,13 @@
-from fastapi import APIRouter, HTTPException, Depends, Body
-from typing import Dict, Any, Optional
+from fastapi import APIRouter, HTTPException, Depends, Body, Query
+from typing import Dict, Any, Optional, List
 import logging
 from datetime import datetime
 import random
 
 from models.forecast import ForecastRequest, ForecastResponse
-from dependencies import get_optional_user, client, DEFAULT_USER_ID
+from dependencies import get_optional_user, client, DEFAULT_USER_ID, parse_date_string
 from forecasting import generate_forecasts, test_forecasts_table_insertion, save_forecasts_to_bigquery
+from database import get_forecasts
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -144,4 +145,22 @@ async def get_saved_forecasts(
         return {"forecasts": forecasts, "count": len(forecasts), "status": "success"}
     except Exception as e:
         logger.error(f"Error retrieving saved forecasts: {e}")
-        return {"forecasts": [], "count": 0, "status": "error", "error": str(e)} 
+        return {"forecasts": [], "count": 0, "status": "error", "error": str(e)}
+
+@router.get("/")
+async def get_forecasts_api(
+    start_date: str = Query(None),
+    end_date: str = Query(None),
+    market: str = Query("Germany")
+):
+    """Get energy price forecasts."""
+    try:
+        start_date_obj = parse_date_string(start_date)
+        end_date_obj = parse_date_string(end_date)
+        
+        forecasts = get_forecasts(market, start_date_obj, end_date_obj)
+        
+        return forecasts
+    except Exception as e:
+        logger.error(f"Error getting forecasts: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) 

@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from typing import Dict, Any
 import logging
 from datetime import datetime
+import platform
 
-from dependencies import client
+from database import test_bigquery_connection, get_bigquery_client
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -11,44 +12,29 @@ logger = logging.getLogger(__name__)
 # Create router
 router = APIRouter()
 
+# Get a BigQuery client instance
+client = get_bigquery_client()
+
 @router.get("/status")
 async def get_api_status():
-    """Check API and BigQuery status."""
+    """Get the API status and basic diagnostics."""
     try:
-        connection_status = "Connected" if client else "Disconnected"
-        config_info = {
-            "project_id": "capstone-henry",
-            "dataset_id": "capstone_db",
-            "main_table": "Market_Data_Germany_Today",
-            "server_time": datetime.now().isoformat(),
-            "database_connection": connection_status
-        }
+        # Check database connection
+        db_connected = test_bigquery_connection()
         
-        # Test query to check BigQuery access
-        if client:
-            try:
-                test_query = """
-                    SELECT COUNT(*) as row_count
-                    FROM `capstone-henry.capstone_db.Market_Data_Germany_Today`
-                """
-                query_job = client.query(test_query)
-                result = list(query_job.result())
-                row_count = result[0]['row_count'] if result else 0
-                config_info["database_access"] = "Success"
-                config_info["row_count"] = row_count
-            except Exception as e:
-                config_info["database_access"] = "Failed"
-                config_info["database_error"] = str(e)
-        else:
-            config_info["database_access"] = "No Client"
-        
-        return {"status": "OK", "version": "1.0", "config": config_info}
-    except Exception as e:
-        logger.error(f"Error in get_api_status: {e}")
         return {
-            "status": "Error",
-            "error": str(e),
-            "server_time": datetime.now().isoformat()
+            "status": "ok",
+            "timestamp": datetime.now().isoformat(),
+            "version": "1.0.0",
+            "database_connected": db_connected,
+            "environment": platform.platform()
+        }
+    except Exception as e:
+        logger.error(f"Error getting API status: {e}")
+        return {
+            "status": "error",
+            "timestamp": datetime.now().isoformat(),
+            "error": str(e)
         }
 
 @router.get("/diagnostic/query")
@@ -121,4 +107,42 @@ async def test_users_table():
         return {"schema": schema_info, "sample_row": sample_row, "message": "Success"}
     except Exception as e:
         logger.error(f"Error checking Users table: {e}")
-        return {"error": str(e), "message": "Failed to retrieve table structure"} 
+        return {"error": str(e), "message": "Failed to retrieve table structure"}
+
+@router.post("/admin/execute-query")
+async def admin_execute_query(query_data: Dict[str, Any]):
+    """
+    Admin endpoint to execute raw SQL queries.
+    WARNING: This endpoint should be secured in production!
+    """
+    try:
+        if not client:
+            return {"success": False, "error": "BigQuery client not initialized"}
+        
+        query = query_data.get("query")
+        if not query:
+            return {"success": False, "error": "No query provided"}
+        
+        # Execute the query
+        logger.info(f"Executing admin query: {query}")
+        query_job = client.query(query)
+        
+        # Try to get results (for SELECT queries)
+        try:
+            results = list(query_job.result())
+            rows = [dict(r.items()) for r in results]
+            return {
+                "success": True,
+                "message": f"Query executed successfully with {len(rows)} results",
+                "results": rows[:10]  # Limit results to avoid huge responses
+            }
+        except Exception:
+            # For INSERT, UPDATE, etc. queries that don't return results
+            return {
+                "success": True,
+                "message": "Query executed successfully with no results",
+                "affected_rows": query_job.num_dml_affected_rows if hasattr(query_job, 'num_dml_affected_rows') else 0
+            }
+    except Exception as e:
+        logger.error(f"Error executing admin query: {e}")
+        return {"success": False, "error": str(e)} 

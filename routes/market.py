@@ -5,13 +5,30 @@ from datetime import datetime, timedelta
 import random
 import math
 
-from dependencies import get_optional_user, client, DEFAULT_USER_ID
+from dependencies import get_optional_user, client, DEFAULT_USER_ID, parse_date_string
+from database import get_market_data
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Create router
 router = APIRouter()
+
+@router.get("/")
+async def get_market_data_api(
+    start_date: str = Query(None),
+    end_date: str = Query(None),
+    min_price: float = Query(None),
+    max_price: float = Query(None),
+    market: str = Query("Germany")
+):
+    """Get market data with optional filters."""
+    try:
+        market_data = get_market_data(start_date, end_date, min_price, max_price, market)
+        return market_data
+    except Exception as e:
+        logger.error(f"Error getting market data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("")
 async def get_market_data(

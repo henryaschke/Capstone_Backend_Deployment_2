@@ -3,7 +3,7 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from google.cloud import bigquery
 
@@ -50,6 +50,32 @@ except Exception as e:
     client = None
 
 # ------------------------------------------------------------------------------
+# Timezone Handling
+# ------------------------------------------------------------------------------
+
+# Define timezone offset for CET/CEST (UTC+1/UTC+2)
+CET_OFFSET = timedelta(hours=1)
+
+def to_cet(dt):
+    """Convert a datetime to CET timezone"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # If naive datetime, assume it's UTC and add CET offset
+        return dt.replace(tzinfo=timezone.utc).astimezone(timezone(CET_OFFSET))
+    return dt.astimezone(timezone(CET_OFFSET))
+
+def from_cet(dt):
+    """Convert a CET datetime to UTC"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # If naive datetime, assume it's CET and convert to UTC
+        cet = timezone(CET_OFFSET)
+        dt = dt.replace(tzinfo=cet)
+    return dt.astimezone(timezone.utc)
+
+# ------------------------------------------------------------------------------
 # Helper Functions for Authentication
 # ------------------------------------------------------------------------------
 
@@ -82,15 +108,33 @@ def parse_date_string(date_str: Optional[str]) -> Optional[datetime]:
     """
     Helper function to parse a date or datetime string into a datetime object.
     Tries ISO-8601 and then "YYYY-MM-DD".
+    Returns a timezone-aware datetime in UTC.
     """
     if not date_str:
         return None
+    
     try:
-        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        # First try ISO format with timezone - this will preserve timezone info
+        dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        
+        # Convert to UTC if it has timezone info
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        else:
+            # If no timezone info, assume UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+            
+        return dt
+    
     except ValueError:
         try:
-            return datetime.strptime(date_str, "%Y-%m-%d")
+            # Try simple date format - assume UTC midnight
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            # Add UTC timezone
+            dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except ValueError:
+            logger.error(f"Could not parse date string: {date_str}")
             return None
 
 # ------------------------------------------------------------------------------
