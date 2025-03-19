@@ -209,38 +209,104 @@ async def get_trade_history_api(
 ):
     """Get trade history (optionally by date range, trade_type, or status)."""
     try:
+        logger.info(f"Trade history request: start_date={start_date}, end_date={end_date}, trade_type={trade_type}, status={status}")
+        start_time = datetime.now()
+        
         # Use provided user_id or fallback to default
         if user_id is None:
             user_id = DEFAULT_USER_ID
+            logger.info(f"Using default user_id: {DEFAULT_USER_ID}")
+        
+        # If user_id is a dict (for some reason), extract the User_ID value
+        if isinstance(user_id, dict) and 'User_ID' in user_id:
+            logger.info(f"Extracted user_id {user_id['User_ID']} from user_id dict")
+            user_id = user_id['User_ID']
             
+        logger.info(f"Getting trades for user_id: {user_id}")
+        
         start_date_obj = parse_date_string(start_date)
         end_date_obj = parse_date_string(end_date)
         
-        trades = get_user_trades(user_id, start_date_obj, end_date_obj)
+        # Adjust end_date to include the full day (23:59:59)
+        if end_date_obj and end_date_obj.hour == 0 and end_date_obj.minute == 0 and end_date_obj.second == 0:
+            logger.info(f"Adjusting end_date from {end_date_obj} to include full day")
+            end_date_obj = end_date_obj.replace(hour=23, minute=59, second=59)
+            logger.info(f"Adjusted end_date to {end_date_obj}")
+        
+        logger.info(f"Calling get_user_trades with user_id={user_id}, start_date={start_date_obj}, end_date={end_date_obj}")
+        
+        # Track time for database query
+        query_start = datetime.now()
+        trades = get_user_trades(user_id, start_date_obj, end_date_obj, cache_bypass=True)
+        query_time = (datetime.now() - query_start).total_seconds()
+        logger.info(f"get_user_trades completed in {query_time:.2f} seconds, returned {len(trades)} trades")
         
         # Filter by trade_type if provided
         if trade_type:
+            logger.info(f"Filtering by trade_type: {trade_type}")
             trades = [t for t in trades if t.get("trade_type", "").lower() == trade_type.lower()]
+            logger.info(f"After trade_type filter: {len(trades)} trades")
         
         # Filter by status if provided
         if status:
+            logger.info(f"Filtering by status: {status}")
             trades = [t for t in trades if t.get("status", "").lower() == status.lower()]
+            logger.info(f"After status filter: {len(trades)} trades")
         
+        # Format the trades for the API response
+        format_start = datetime.now()
         result = []
         for t in trades:
+            # Extract field values with fallbacks for different case conventions (database returned keys)
+            trade_id = t.get("trade_id", t.get("Trade_ID", ""))
+            trade_type = t.get("trade_type", t.get("Trade_Type", ""))
+            quantity = t.get("quantity", t.get("Quantity", 0))
+            
+            # Timestamp handling
+            timestamp = t.get("timestamp", t.get("Timestamp", datetime.now()))
+            timestamp_iso = timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp
+            
+            # Resolution
+            resolution = t.get("resolution", t.get("Resolution", 15))
+            
+            # Status
+            status = t.get("status", t.get("Status", "pending"))
+            
+            # Market
+            market = t.get("market", t.get("Market", "Germany"))
+            
+            # Created at
+            created_at = t.get("created_at", t.get("Created_At", datetime.now()))
+            created_at_iso = created_at.isoformat() if isinstance(created_at, datetime) else created_at
+            
+            # Trade price
+            trade_price = t.get("trade_price", t.get("Trade_Price", 0))
+            
+            logger.info(f"Processing trade: ID={trade_id}, Type={trade_type}, Quantity={quantity}, Price={trade_price}")
+            
             result.append({
-                "trade_id": t.get("trade_id", ""),
-                "type": t.get("trade_type", ""),
-                "quantity": t.get("quantity", 0),
-                "timestamp": t.get("timestamp", datetime.now()).isoformat(),
-                "resolution": t.get("resolution", 15),
-                "status": t.get("status", "pending"),
-                "market": t.get("market", "Germany"),
-                "created_at": t.get("created_at", datetime.now()).isoformat()
+                "trade_id": trade_id,
+                "type": trade_type.lower() if isinstance(trade_type, str) else trade_type,
+                "quantity": float(quantity) if quantity is not None else 0.0,  # Ensure quantity is a float
+                "timestamp": timestamp_iso,
+                "resolution": resolution,
+                "status": status.lower() if isinstance(status, str) else status,
+                "market": market,
+                "created_at": created_at_iso,
+                "trade_price": float(trade_price) if trade_price is not None else 0.0  # Ensure price is a float
             })
+        format_time = (datetime.now() - format_start).total_seconds()
+        
+        total_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Trade history API completed in {total_time:.2f} seconds. Query: {query_time:.2f}s, Format: {format_time:.2f}s")
+        logger.info(f"Returning {len(result)} trades")
+        
         return result
     except Exception as e:
         logger.error(f"Error getting trade history: {e}")
+        # Log the full stack trace for better debugging
+        import traceback
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/execute-pending/{trade_id}")

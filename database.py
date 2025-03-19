@@ -16,6 +16,17 @@ DATASET_ID = "capstone_db"
 # Global database instance for singleton pattern
 _db_instance = None
 
+# Cache for user trades to avoid repeated DB calls
+_user_trades_cache = {}
+_user_trades_cache_ttl = 300  # 5 minutes TTL
+_user_trades_cache_last_updated = {}
+
+def serialize_datetime(obj):
+    """Helper function to serialize datetime objects to ISO format strings."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    return obj
+
 class BigQueryDatabase:
     def __init__(self):
         """
@@ -40,7 +51,8 @@ class BigQueryDatabase:
     def execute_query(
         self, 
         query: str, 
-        params: Optional[List[bigquery.ScalarQueryParameter]] = None
+        params: Optional[List[bigquery.ScalarQueryParameter]] = None,
+        timeout: int = 60  # Default timeout in seconds
     ) -> List[Dict[str, Any]]:
         """
         Execute a BigQuery query and return the results as a list of dictionaries.
@@ -51,17 +63,51 @@ class BigQueryDatabase:
             if params:
                 job_config = bigquery.QueryJobConfig(query_parameters=params)
             
-            query_job = self.client.query(query, job_config=job_config)
-            results = query_job.result()
+            logger.info(f"Executing BigQuery query with timeout={timeout}s: {query}")
+            if params:
+                logger.info(f"Query parameters: {params}")
             
-            # Convert results to a list of dicts
-            return [dict(row.items()) for row in results]
+            # Start the query with a specific timeout
+            query_job = self.client.query(
+                query, 
+                job_config=job_config, 
+                timeout=timeout
+            )
+            
+            # Wait for the query to complete with timeout
+            try:
+                start_time = datetime.now()
+                results = query_job.result(timeout=timeout)
+                query_time = (datetime.now() - start_time).total_seconds()
+                logger.info(f"Query executed in {query_time:.2f} seconds")
+            except Exception as timeout_error:
+                logger.error(f"Query execution timed out after {timeout} seconds: {timeout_error}")
+                # Try to cancel the job if it's still running
+                if query_job.state != 'DONE':
+                    query_job.cancel()
+                raise timeout_error
+            
+            # Convert results to a list of dicts and handle datetime serialization
+            result_list = []
+            for row in results:
+                row_dict = dict(row.items())
+                # Convert datetime objects to ISO format strings
+                for key, value in row_dict.items():
+                    if isinstance(value, datetime):
+                        row_dict[key] = value.isoformat()
+                result_list.append(row_dict)
+            
+            logger.info(f"Query returned {len(result_list)} rows")
+            return result_list
         except Exception as e:
-            logger.error(f"Query execution error: {e}")
+            error_type = type(e).__name__
+            logger.error(f"Query execution error ({error_type}): {str(e)}")
             logger.error(f"Query: {query}")
             if params:
                 logger.error(f"Params: {params}")
-            raise
+            # Return empty list on error rather than raising
+            logger.warning("Returning empty list due to query error")
+            return []
     
     def insert_row(self, table_name: str, row_data: Dict[str, Any]) -> bool:
         """Insert a single row into a table."""
@@ -91,6 +137,11 @@ class BigQueryDatabase:
                         logger.info(f"Replacing None User_ID with default value 1")
                     else:
                         continue
+                
+                # Handle nested user dictionary in User_ID
+                if key == "User_ID" and isinstance(value, dict) and "User_ID" in value:
+                    value = value.get("User_ID")
+                    logger.info(f"Extracted User_ID {value} from dictionary")
                 
                 # Convert datetime objects to ISO strings
                 if isinstance(value, datetime):
@@ -258,56 +309,99 @@ def get_portfolio_by_user_id(user_id: int) -> Optional[Dict[str, Any]]:
 def get_user_trades(
     user_id: int, 
     start_date: Optional[datetime] = None, 
-    end_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None,
+    cache_bypass: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Return a user's trades, optionally filtered by a date range.
+    Uses a simple in-memory cache to improve performance.
     """
+    # Create a cache key based on function parameters
+    cache_key = f"{user_id}_{start_date}_{end_date}"
+    
+    # Check if we have a valid cached result
+    current_time = datetime.now()
+    if (not cache_bypass and 
+        cache_key in _user_trades_cache and
+        cache_key in _user_trades_cache_last_updated and
+        (current_time - _user_trades_cache_last_updated[cache_key]).total_seconds() < _user_trades_cache_ttl):
+        logger.info(f"Using cached trade data for user {user_id} (cache age: {(current_time - _user_trades_cache_last_updated[cache_key]).total_seconds():.1f}s)")
+        return _user_trades_cache[cache_key]
+    
+    logger.info(f"Cache miss or bypass for user {user_id} trades, fetching from database")
     db = get_db()
     
     # For mock/development mode
     if not db.client:
         logger.info(f"Using mock data for get_user_trades (user_id: {user_id})")
-        # Return some mock data for development
-        mock_trades = []
-        # Add the most recent trade we just created (if testing with ID 999999)
-        mock_trades.append({
-            "trade_id": 999999,
-            "trade_type": "buy",
-            "quantity": 2.0,
-            "timestamp": datetime(2025, 3, 17, 23, 30, 0),
-            "resolution": 30,
-            "status": "pending",
-            "market": "Germany",
-            "created_at": datetime.now()
-        })
-        return mock_trades
+        # Create several mock trades with unique IDs
+        base_id = 87654  # Start with a different base ID
+        
+        # Add several mock trades with unique IDs
+        for i in range(5):
+            # Vary the trade type
+            trade_type = "buy" if i % 2 == 0 else "sell"
+            
+            # Create a timestamp that varies by hours
+            trade_time = datetime(2025, 3, 17, 18 + i, 30, 0) if i < 6 else datetime(2025, 3, 18, i - 6, 30, 0)
+            
+            # Create a unique trade ID
+            trade_id = base_id + i
+            
+            mock_trades = [{
+                "trade_id": trade_id,
+                "trade_type": trade_type,
+                "quantity": float(i + 1) * 0.5,
+                "timestamp": trade_time,
+                "resolution": 15 if i % 3 == 0 else 30 if i % 3 == 1 else 60,
+                "status": "executed" if i % 4 == 0 else "pending",
+                "market": "Germany",
+                "created_at": datetime.now() - timedelta(hours=i),
+                "trade_price": 50.0 + (i * 2.5)
+            }]
+        
+            # Cache the mock data
+            _user_trades_cache[cache_key] = mock_trades
+            _user_trades_cache_last_updated[cache_key] = current_time
+            return mock_trades
     
+    # Build the query with a higher timeout for complex queries
     query = f"""
         SELECT *
         FROM `{db.get_table_ref("Trades")}`
-        WHERE user_id = @user_id
+        WHERE User_ID = @user_id
     """
     params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
     
     if start_date:
-        query += " AND timestamp >= @start_date"
+        query += " AND Timestamp >= @start_date"
         params.append(bigquery.ScalarQueryParameter("start_date", "TIMESTAMP", start_date))
     
     if end_date:
-        query += " AND timestamp <= @end_date"
+        query += " AND Timestamp <= @end_date"
         params.append(bigquery.ScalarQueryParameter("end_date", "TIMESTAMP", end_date))
     
-    query += " ORDER BY timestamp DESC"
+    query += " ORDER BY Timestamp DESC"
     
     try:
-        result = db.execute_query(query, params)
+        # Use a longer timeout for this query
+        start_time = datetime.now()
+        result = db.execute_query(query, params, timeout=60)
+        query_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Trade query for user {user_id} completed in {query_time:.2f} seconds")
+        
         # Ensure trade_id is properly mapped from Trade_ID
         for trade in result:
             if "Trade_ID" in trade and "trade_id" not in trade:
                 trade["trade_id"] = trade["Trade_ID"]
             if "Trade_Type" in trade and "trade_type" not in trade:
                 trade["trade_type"] = trade["Trade_Type"]
+        
+        # Cache the result
+        _user_trades_cache[cache_key] = result
+        _user_trades_cache_last_updated[cache_key] = current_time
+        logger.info(f"Cached {len(result)} trades for user {user_id}")
+        
         return result
     except Exception as e:
         logger.error(f"Error getting user trades: {e}")
@@ -404,6 +498,17 @@ def create_trade(trade_data: Dict[str, Any]) -> bool:
             logger.info(f"Inserting trade data: {trade_data}")
             success = db.insert_row("Trades", trade_data)
             logger.info(f"Trade creation result: {success}")
+            
+            # Clear the cache for this user
+            if success and user_id:
+                logger.info(f"Clearing trade cache for user {user_id} after trade creation")
+                global _user_trades_cache, _user_trades_cache_last_updated
+                for key in list(_user_trades_cache.keys()):
+                    if key.startswith(f"{user_id}_"):
+                        _user_trades_cache.pop(key, None)
+                        _user_trades_cache_last_updated.pop(key, None)
+                logger.info("Trade cache cleared")
+            
             return success
         except Exception as e:
             logger.error(f"Error with Trades table: {e}")

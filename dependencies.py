@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 import logging
 from google.cloud import bigquery
+import inspect
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -128,10 +129,24 @@ def parse_date_string(date_str: Optional[str]) -> Optional[datetime]:
     
     except ValueError:
         try:
-            # Try simple date format - assume UTC midnight
+            # Try simple date format
             dt = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            # If this is a end_date parameter (we can infer from request context),
+            # we should set the time to 23:59:59 to include the entire day
+            # Otherwise, use midnight (00:00:00) as default
+            
+            # Unfortunately we don't have context to know if this is start or end date
+            # Let's check the thread name or caller function name to determine
+            caller_frame = inspect.currentframe().f_back
+            caller_name = caller_frame.f_code.co_name if caller_frame else ""
+            
             # Add UTC timezone
             dt = dt.replace(tzinfo=timezone.utc)
+            
+            # Log for debugging
+            logger.info(f"Parsed date string '{date_str}' to {dt.isoformat()}")
+            
             return dt
         except ValueError:
             logger.error(f"Could not parse date string: {date_str}")
