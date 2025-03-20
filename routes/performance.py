@@ -3,7 +3,7 @@ from typing import Dict, Any, Optional, List
 import logging
 from datetime import datetime, timedelta
 
-from dependencies import get_optional_user, DEFAULT_USER_ID, parse_date_string
+from dependencies import get_current_user, parse_date_string
 from database import get_performance_metrics
 
 # Configure logging
@@ -16,14 +16,17 @@ router = APIRouter()
 async def get_performance_metrics_api(
     start_date: str = Query(None),
     end_date: str = Query(None),
-    user_id: int = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Get performance metrics for a user."""
     try:
-        # Use provided user_id or fallback to default
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
         if user_id is None:
-            user_id = DEFAULT_USER_ID
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
             
+        logger.info(f"Getting performance metrics for authenticated user_id: {user_id}")
+        
         start_date_obj = parse_date_string(start_date)
         end_date_obj = parse_date_string(end_date)
         
@@ -42,6 +45,9 @@ async def get_performance_metrics_api(
         metrics["chartData"] = sorted(chart_data, key=lambda x: x["date"])
         
         return metrics
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error getting performance metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e)) 

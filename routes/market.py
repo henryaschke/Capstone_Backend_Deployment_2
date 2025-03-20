@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import random
 import math
 
-from dependencies import get_optional_user, client, DEFAULT_USER_ID, parse_date_string
+from dependencies import get_current_user, client, parse_date_string
 from database import get_market_data
 
 # Configure logging
@@ -20,12 +20,23 @@ async def get_market_data_api(
     end_date: str = Query(None),
     min_price: float = Query(None),
     max_price: float = Query(None),
-    market: str = Query("Germany")
+    market: str = Query("Germany"),
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Get market data with optional filters."""
     try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Fetching market data for authenticated user_id: {user_id}")
+        
         market_data = get_market_data(start_date, end_date, min_price, max_price, market)
         return market_data
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error getting market data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -34,13 +45,20 @@ async def get_market_data_api(
 async def get_market_data(
     date: str = None, 
     market: str = "Germany", 
-    current_user: Dict[str, Any] = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
     Get single-day market data for a given date and market.
     Demonstrates usage of Market_Data_Germany_Today.
     """
     try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Fetching market data for authenticated user_id: {user_id}")
+        
         if not date:
             date = datetime.now().strftime('%Y-%m-%d')
         logger.info(f"Fetching market data for date: {date}, market: {market}")
@@ -87,6 +105,9 @@ async def get_market_data(
             market_data = generate_sample_market_data(date, market)
         
         return market_data
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error in get_market_data endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -118,12 +139,19 @@ async def get_germany_market_data(
     end_date: str = None,
     resolution: int = None,
     limit: int = 1000,
-    current_user: Dict[str, Any] = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
     Get historical market data (Market_Data_Germany) with optional date range and resolution.
     """
     try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Fetching Germany market data for authenticated user_id: {user_id}")
+        
         if not client:
             raise HTTPException(status_code=500, detail="BigQuery client not initialized.")
         
@@ -210,6 +238,9 @@ async def get_germany_market_data(
             market_data = generate_sample_germany_market_data(start_date, end_date)
         
         return market_data
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error in get_germany_market_data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -266,13 +297,20 @@ def generate_sample_germany_market_data(start_date, end_date):
 @router.get("/realtime")
 async def get_realtime_prices(
     date: Optional[str] = None,
-    current_user: Dict[str, Any] = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
     Get real-time price data for today's date (or a specified date).
     Demonstrates reading from a 'Market_Data_Germany_Today' table.
     """
     try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Fetching realtime prices for authenticated user_id: {user_id}")
+        
         # Default to today's date if none provided
         if not date:
             date = datetime.now().strftime('%Y-%m-%d')
@@ -326,6 +364,9 @@ async def get_realtime_prices(
             price_data = generate_sample_price_data(date)
         
         return price_data
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"Error in get_realtime_prices: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching price data: {str(e)}")

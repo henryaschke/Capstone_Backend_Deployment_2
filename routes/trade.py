@@ -1,16 +1,19 @@
-from fastapi import APIRouter, Query, HTTPException, Depends, Path
+from fastapi import APIRouter, Query, HTTPException, Depends, Path, Body
 from typing import Dict, Any, Optional, List
 import logging
 from datetime import datetime, timedelta, timezone
 import uuid
 import math
+import pytz
+from google.cloud import bigquery
 
 from models.trade import TradeRequest
-from dependencies import get_optional_user, DEFAULT_USER_ID, parse_date_string
+from dependencies import get_optional_user, get_current_user, DEFAULT_USER_ID, parse_date_string
 from database import (
     create_trade, get_user_trades, get_battery_status, create_battery_if_not_exists,
     get_trade_by_id, update_trade_status, update_battery_level, get_pending_trades,
-    get_market_data_today, update_portfolio_balance, get_portfolio_by_user_id
+    get_market_data_today, update_portfolio_balance, get_portfolio_by_user_id,
+    get_db, PROJECT_ID, DATASET_ID
 )
 
 # Configure logging
@@ -24,6 +27,9 @@ router = APIRouter()
 # For CET (winter time): timedelta(hours=1)
 # For CEST (summer time): timedelta(hours=2)
 CET_OFFSET = timedelta(hours=1)
+
+# Define Central European Time timezone
+CET = pytz.timezone('Europe/Berlin')
 
 def to_cet(dt):
     """Convert a datetime to CET timezone"""
@@ -50,11 +56,18 @@ def normalize_datetime(dt):
 @router.post("/execute")
 async def execute_trade(
     request: TradeRequest,
-    user_id: int = Depends(get_optional_user),
+    current_user: Dict[str, Any] = Depends(get_current_user),
     test_mode: bool = Query(False, description="Enable test mode to bypass time validation")
 ):
     """Execute a trade (buy or sell) for the German energy market."""
     try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Executing trade for authenticated user_id: {user_id}")
+        
         # Check if the execution time is in the future
         # Convert the execution time to a timezone-aware datetime in UTC
         execution_time = datetime.fromisoformat(request.executionTime.replace('Z', '+00:00'))
@@ -205,24 +218,19 @@ async def get_trade_history_api(
     end_date: str = Query(None),
     trade_type: str = Query(None),
     status: str = Query(None),
-    user_id: int = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Get trade history (optionally by date range, trade_type, or status)."""
     try:
         logger.info(f"Trade history request: start_date={start_date}, end_date={end_date}, trade_type={trade_type}, status={status}")
         start_time = datetime.now()
         
-        # Use provided user_id or fallback to default
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
         if user_id is None:
-            user_id = DEFAULT_USER_ID
-            logger.info(f"Using default user_id: {DEFAULT_USER_ID}")
-        
-        # If user_id is a dict (for some reason), extract the User_ID value
-        if isinstance(user_id, dict) and 'User_ID' in user_id:
-            logger.info(f"Extracted user_id {user_id['User_ID']} from user_id dict")
-            user_id = user_id['User_ID']
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
             
-        logger.info(f"Getting trades for user_id: {user_id}")
+        logger.info(f"Getting trades for authenticated user_id: {user_id}")
         
         start_date_obj = parse_date_string(start_date)
         end_date_obj = parse_date_string(end_date)
@@ -312,13 +320,16 @@ async def get_trade_history_api(
 @router.post("/execute-pending/{trade_id}")
 async def execute_pending_trade(
     trade_id: int = Path(..., description="The ID of the trade to execute"),
-    user_id: int = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Execute a specific pending trade by updating its status and related resources."""
     try:
-        # Use provided user_id or fallback to default
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
         if user_id is None:
-            user_id = DEFAULT_USER_ID
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Executing pending trade for authenticated user_id: {user_id}")
         
         # Get the trade
         trade = get_trade_by_id(trade_id)
@@ -328,19 +339,15 @@ async def execute_pending_trade(
         # Log the retrieved trade for debugging
         logger.info(f"Retrieved trade: {trade}")
         
-        # For testing, we're skipping user validation
-        # In production, you'd want to enforce this
         # Check if trade belongs to the user
         trade_user_id = trade.get("User_ID", trade.get("user_id"))
         logger.info(f"Trade user_id: {trade_user_id}, Current user_id: {user_id}")
-        # Temporarily skip this check for testing
-        '''
+        
         if trade_user_id != user_id:
             raise HTTPException(
                 status_code=403, 
                 detail=f"Trade with ID {trade_id} does not belong to current user"
             )
-        '''
         
         # Check if trade is already executed
         trade_status = trade.get("Status", trade.get("status", "")).lower()
@@ -371,20 +378,22 @@ async def execute_pending_trade(
 
 @router.post("/execute-all-pending")
 async def execute_all_pending_trades(
-    user_id: int = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Execute all pending trades that are due for execution."""
     try:
-        # Use provided user_id or fallback to default
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
         if user_id is None:
-            user_id = DEFAULT_USER_ID
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Executing pending trades for authenticated user_id: {user_id}")
         
         # Get all pending trades
         pending_trades = get_pending_trades()
         
-        # Filter trades for the current user if needed
-        if user_id != DEFAULT_USER_ID:  # Only filter if not admin
-            pending_trades = [t for t in pending_trades if t.get("User_ID", t.get("user_id")) == user_id]
+        # Filter trades for the current user
+        pending_trades = [t for t in pending_trades if t.get("User_ID", t.get("user_id")) == user_id]
         
         if not pending_trades:
             return {"success": True, "message": "No pending trades found ready for execution", "executed_count": 0}
@@ -422,6 +431,174 @@ async def execute_all_pending_trades(
     
     except Exception as e:
         logger.error(f"Error executing pending trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/cancel-all-pending")
+async def cancel_all_pending_trades(
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Cancel all pending trades for the current user by deleting them."""
+    try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Deleting pending trades for authenticated user_id: {user_id}")
+        
+        # Get a database connection
+        db = get_db()
+        
+        # Execute a direct query to get pending trades - case insensitive and covering NULL status
+        query = f"""
+            SELECT *
+            FROM `{PROJECT_ID}.{DATASET_ID}.Trades`
+            WHERE User_ID = @user_id
+            AND (
+                LOWER(IFNULL(Status, '')) = 'pending' 
+                OR Status IS NULL 
+                OR TRIM(Status) = ''
+            )
+        """
+        params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
+        
+        logger.info(f"Executing direct query for pending trades: {query}")
+        logger.info(f"With parameters: {params}")
+        
+        # Execute query directly
+        pending_trades = db.execute_query(query, params)
+        
+        logger.info(f"Direct query found {len(pending_trades)} pending trades")
+        
+        # Debug log each pending trade found
+        for trade in pending_trades:
+            trade_id = trade.get("Trade_ID", trade.get("trade_id"))
+            timestamp = trade.get("Timestamp", trade.get("timestamp"))
+            status = trade.get("Status", trade.get("status", "unknown"))
+            type_value = trade.get("Trade_Type", trade.get("trade_type", "unknown"))
+            quantity = trade.get("Quantity", trade.get("quantity", "unknown"))
+            logger.info(f"Found pending trade: ID={trade_id}, Timestamp={timestamp}, Status={status}, Type={type_value}, Quantity={quantity}")
+        
+        if not pending_trades:
+            # Get all user trades to check what's in the database
+            all_trades_query = f"""
+                SELECT Trade_ID, Status, Trade_Type, Quantity, Timestamp
+                FROM `{PROJECT_ID}.{DATASET_ID}.Trades`
+                WHERE User_ID = @user_id
+                ORDER BY Timestamp DESC
+            """
+            all_trades = db.execute_query(all_trades_query, params)
+            
+            logger.info(f"Found {len(all_trades)} total trades for user {user_id}")
+            
+            # Log each trade for debugging
+            for trade in all_trades:
+                trade_id = trade.get("Trade_ID", trade.get("trade_id"))
+                status_value = trade.get("Status", trade.get("status", "unknown"))
+                type_value = trade.get("Trade_Type", trade.get("trade_type", "unknown"))
+                quantity = trade.get("Quantity", trade.get("quantity", "unknown"))
+                logger.info(f"Trade in database: ID={trade_id}, Status='{status_value}' (type: {type(status_value)}), Type={type_value}, Quantity={quantity}")
+            
+            logger.info(f"No pending trades found for user {user_id}")
+            return {"success": True, "message": "No pending trades found to cancel", "canceled_count": 0}
+        
+        logger.info(f"Found {len(pending_trades)} pending trades for user {user_id}")
+        
+        # Delete each pending trade instead of updating status
+        results = []
+        deleted_count = 0
+        failed_count = 0
+        
+        for trade in pending_trades:
+            try:
+                trade_id = trade.get("Trade_ID", trade.get("trade_id"))
+                logger.info(f"Attempting to delete trade ID: {trade_id}")
+                
+                # Delete the trade record directly
+                delete_success = db.delete_row("Trades", "Trade_ID", trade_id)
+                
+                if delete_success:
+                    logger.info(f"Successfully deleted trade ID: {trade_id}")
+                    results.append({
+                        "trade_id": trade_id,
+                        "success": True,
+                        "message": "Trade successfully deleted"
+                    })
+                    deleted_count += 1
+                else:
+                    logger.error(f"Failed to delete trade ID: {trade_id}")
+                    
+                    # As a fallback, try manual SQL delete if the delete_row method fails
+                    logger.info(f"Attempting direct SQL DELETE for trade ID: {trade_id}")
+                    
+                    # Direct SQL DELETE 
+                    delete_query = f"""
+                        DELETE FROM `{PROJECT_ID}.{DATASET_ID}.Trades`
+                        WHERE Trade_ID = @trade_id
+                    """
+                    delete_params = [bigquery.ScalarQueryParameter("trade_id", "INTEGER", trade_id)]
+                    
+                    try:
+                        job_config = bigquery.QueryJobConfig(query_parameters=delete_params)
+                        query_job = db.client.query(delete_query, job_config=job_config)
+                        query_job.result()  # Wait for job completion
+                        
+                        # Check if the delete was successful
+                        verify_query = f"""
+                            SELECT COUNT(*) as count
+                            FROM `{PROJECT_ID}.{DATASET_ID}.Trades`
+                            WHERE Trade_ID = @trade_id
+                        """
+                        verify_job_config = bigquery.QueryJobConfig(query_parameters=delete_params)
+                        verify_job = db.client.query(verify_query, job_config=verify_job_config)
+                        results_verify = [row for row in verify_job]
+                        
+                        if len(results_verify) > 0 and results_verify[0].get('count', 0) == 0:
+                            logger.info(f"Direct SQL DELETE successful for trade ID: {trade_id}")
+                            results.append({
+                                "trade_id": trade_id,
+                                "success": True,
+                                "message": "Trade successfully deleted (via direct SQL)"
+                            })
+                            deleted_count += 1
+                        else:
+                            logger.error(f"Direct SQL DELETE verification failed for trade ID: {trade_id}")
+                            results.append({
+                                "trade_id": trade_id,
+                                "success": False,
+                                "message": "Failed to delete trade (direct SQL failed)"
+                            })
+                            failed_count += 1
+                    except Exception as sql_error:
+                        logger.error(f"Direct SQL DELETE failed for trade ID: {trade_id}: {sql_error}")
+                        results.append({
+                            "trade_id": trade_id,
+                            "success": False,
+                            "message": f"Failed to delete trade: {str(sql_error)}"
+                        })
+                        failed_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Error cancelling trade {trade.get('Trade_ID', trade.get('trade_id'))}: {e}")
+                results.append({
+                    "trade_id": trade.get("Trade_ID", trade.get("trade_id")),
+                    "success": False,
+                    "message": str(e)
+                })
+                failed_count += 1
+        
+        return {
+            "success": True,
+            "message": f"Processed {len(pending_trades)} pending trades. {deleted_count} deleted, {failed_count} failed.",
+            "canceled_count": deleted_count,
+            "failed_count": failed_count,
+            "results": results
+        }
+    
+    except Exception as e:
+        logger.error(f"Error processing pending trades: {e}")
+        import traceback
+        logger.error(f"Stack trace: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 async def _process_trade_execution(trade_id: int):

@@ -229,6 +229,62 @@ class BigQueryDatabase:
             logger.error(f"Error updating row in {table_name}: {e}")
             return False
     
+    def delete_row(
+        self, 
+        table_name: str, 
+        condition_field: str, 
+        condition_value: Any
+    ) -> bool:
+        """
+        Delete rows from a BigQuery table using a DELETE statement.
+        """
+        try:
+            table_ref = self.get_table_ref(table_name)
+            
+            # Build query parameter for condition
+            param = bigquery.ScalarQueryParameter(
+                condition_field, 
+                self._get_bigquery_type(condition_value), 
+                condition_value
+            )
+            
+            # Construct the delete query
+            query = f"""
+                DELETE FROM `{table_ref}`
+                WHERE {condition_field} = @{condition_field}
+            """
+            
+            logger.info(f"Executing delete query: {query}")
+            logger.info(f"With parameter: {condition_field}={condition_value}")
+            
+            job_config = bigquery.QueryJobConfig(query_parameters=[param])
+            query_job = self.client.query(query, job_config=job_config)
+            query_job.result()  # Wait for job completion
+            
+            # Verify deletion
+            verify_query = f"""
+                SELECT COUNT(*) as count
+                FROM `{table_ref}`
+                WHERE {condition_field} = @{condition_field}
+            """
+            
+            verify_job_config = bigquery.QueryJobConfig(query_parameters=[param])
+            verify_job = self.client.query(verify_query, job_config=verify_job_config)
+            results = [row for row in verify_job]
+            
+            if len(results) > 0 and results[0].get('count', 0) == 0:
+                logger.info(f"Successfully deleted row from {table_name} where {condition_field}={condition_value}")
+                return True
+            else:
+                logger.warning(f"Row may not have been deleted from {table_name} where {condition_field}={condition_value}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error deleting row from {table_name}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+    
     def _get_bigquery_type(self, value: Any) -> str:
         """
         Helper to map Python types to BigQuery parameter types.
@@ -914,49 +970,96 @@ def update_trade_status(trade_id: int, update_data: Dict[str, Any]) -> bool:
         return True
     
     try:
-        # First, get the current table schema to validate fields
-        schema_query = f"""
-            SELECT column_name
-            FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
-            WHERE table_name = 'Trades'
-        """
-        schema_result = db.execute_query(schema_query)
-        valid_columns = [row.get('column_name') for row in schema_result]
-        logger.info(f"Valid Trades columns: {valid_columns}")
+        # Verify the trade exists before updating
+        existing_trade = get_trade_by_id(trade_id)
+        if not existing_trade:
+            logger.error(f"Cannot update trade {trade_id}: Trade not found")
+            return False
+            
+        logger.info(f"Found existing trade: {existing_trade}")
+        
+        # Hard-code the column names based on the actual database schema
+        # Instead of dynamic schema query that might be having issues
+        valid_columns = ["Trade_ID", "User_ID", "Market", "Trade_Type", "Quantity", 
+                        "Trade_Price", "Timestamp", "Status", "Error_Message", "Resolution"]
+        
+        logger.info(f"Using known Trades columns: {valid_columns}")
         
         # Filter update_data to include only valid columns
         filtered_update_data = {}
         for key, value in update_data.items():
             if key in valid_columns:
                 filtered_update_data[key] = value
+                logger.info(f"Including field {key}={value} in update")
             else:
-                logger.warning(f"Skipping invalid column '{key}' when updating trade {trade_id}")
-        
-        # Add timestamp for when the trade was updated
-        if "Update_Time" in valid_columns:
-            filtered_update_data["Update_Time"] = datetime.now()
-        
-        # If "Execution_Time" was in the original data but not in the schema, log the timestamp in a comment
-        if "Execution_Time" in update_data and "Execution_Time" not in valid_columns:
-            logger.info(f"Execution time {update_data['Execution_Time']} not stored (column missing)")
-            
-            # If "Comments" or similar field exists, add execution time there
-            for comments_field in ["Comments", "Notes", "Details"]:
-                if comments_field in valid_columns:
-                    filtered_update_data[comments_field] = f"Executed at {update_data['Execution_Time'].isoformat()}"
-                    break
+                # Check for case-insensitive match and map to correct case
+                key_lower = key.lower()
+                for valid_col in valid_columns:
+                    if valid_col.lower() == key_lower:
+                        filtered_update_data[valid_col] = value
+                        logger.info(f"Mapped field {key} to {valid_col}={value} in update")
+                        break
+                else:
+                    logger.warning(f"Skipping invalid column '{key}' when updating trade {trade_id}")
         
         # If we have no valid fields to update, return success
         if not filtered_update_data:
-            logger.warning(f"No valid fields to update for trade {trade_id}")
+            logger.warning(f"No valid fields to update for trade {trade_id}. Original data: {update_data}")
             return True
         
         # Update the trade using the update_row method with validated data
         logger.info(f"Updating trade {trade_id} with filtered data: {filtered_update_data}")
-        success = db.update_row("Trades", filtered_update_data, "Trade_ID", trade_id)
+        
+        # Create SET clause for the UPDATE statement
+        set_clause = ", ".join([f"{key} = @{key}" for key in filtered_update_data.keys()])
+        
+        # Build query parameters
+        params = [
+            bigquery.ScalarQueryParameter(
+                "Trade_ID", 
+                "INTEGER", 
+                trade_id
+            )
+        ]
+        for key, value in filtered_update_data.items():
+            params.append(
+                bigquery.ScalarQueryParameter(
+                    key, 
+                    db._get_bigquery_type(value), 
+                    value
+                )
+            )
+        
+        # Construct the update query with explicit project/dataset
+        query = f"""
+            UPDATE `{PROJECT_ID}.{DATASET_ID}.Trades`
+            SET {set_clause}
+            WHERE Trade_ID = @Trade_ID
+        """
+        
+        logger.info(f"Executing direct update query: {query}")
+        logger.info(f"Query parameters: {params}")
+        
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        query_job = db.client.query(query, job_config=job_config)
+        result = query_job.result()  # Wait for job completion
+        
+        # Check if the update was successful by getting the updated row
+        updated_trade = get_trade_by_id(trade_id)
+        logger.info(f"After update, trade status is: {updated_trade.get('Status', 'unknown')}")
+        
+        # Verify the update was successful by comparing the updated values
+        success = True
+        for key, value in filtered_update_data.items():
+            if updated_trade.get(key) != value:
+                logger.error(f"Update verification failed: {key} expected={value}, actual={updated_trade.get(key)}")
+                success = False
+        
         return success
     except Exception as e:
         logger.error(f"Error updating trade status: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
 def update_battery_level(user_id: int, new_level: float) -> bool:

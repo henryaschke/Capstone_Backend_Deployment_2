@@ -5,9 +5,10 @@ from datetime import datetime
 import random
 
 from models.forecast import ForecastRequest, ForecastResponse
-from dependencies import get_optional_user, client, DEFAULT_USER_ID, parse_date_string
+from dependencies import get_optional_user, get_current_user, client, DEFAULT_USER_ID, parse_date_string
 from forecasting import generate_forecasts, test_forecasts_table_insertion, save_forecasts_to_bigquery
 from database import get_forecasts
+from google.cloud import bigquery
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -20,15 +21,21 @@ router = APIRouter()
 async def generate_price_forecasts(
     request: ForecastRequest = Body(default=ForecastRequest()),
     save_to_database: bool = True,
-    user_id: int = 1,
     model_info: str = "RandomForestRegressor",
-    current_user: Dict[str, Any] = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
     Generate price forecasts for future time periods that haven't cleared yet.
     This uses a separate forecasting module 'generate_forecasts' for the logic.
     """
     try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Generating forecasts for authenticated user_id: {user_id}")
+        
         # Handle both POST with request body and GET with query parameters
         # For GET requests, we'll use query parameters, for POST, we'll use the request body
         if request and isinstance(request, ForecastRequest):
@@ -36,15 +43,15 @@ async def generate_price_forecasts(
             resolutions = request.resolutions
             save_to_db = request.save_to_database
             model = request.model_info
-            uid = request.user_id
+            # Override any user_id in the request with the authenticated user
+            # request.user_id = user_id
         else:
             # Using query parameters from GET
             resolutions = [15, 30, 60]  # Default resolutions
             save_to_db = save_to_database
             model = model_info
-            uid = user_id
             
-        logger.info(f"Generating price forecasts for resolutions: {resolutions}")
+        logger.info(f"Generating price forecasts for resolutions: {resolutions} and user_id: {user_id}")
         
         if not client:
             raise HTTPException(status_code=500, detail="BigQuery client not initialized.")
@@ -55,7 +62,7 @@ async def generate_price_forecasts(
             resolution_minutes=resolutions,
             save_to_database=save_to_db,
             model_info=model,
-            user_id=uid
+            user_id=user_id  # Pass the authenticated user ID
         )
         
         if forecasts.get("status") == "error":
@@ -68,22 +75,28 @@ async def generate_price_forecasts(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/latest")
-async def get_latest_forecasts(current_user: Dict[str, Any] = Depends(get_optional_user)):
+async def get_latest_forecasts(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Retrieve the latest generated forecasts without generating new ones."""
     # For demonstration, we'll just call generate_price_forecasts again.
-    return await generate_price_forecasts()
+    return await generate_price_forecasts(current_user=current_user)
 
 @router.get("/saved")
 async def get_saved_forecasts(
     date: Optional[str] = None,
     limit: int = 20,
-    user_id: Optional[int] = None,
     resolution: Optional[int] = None,
     active_only: bool = False,
-    current_user: Dict[str, Any] = Depends(get_optional_user)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Retrieve saved forecasts from the 'Forecasts' table."""
+    """Retrieve saved forecasts from the 'Forecasts' table for the authenticated user."""
     try:
+        # Extract user_id from the current_user dictionary
+        user_id = current_user.get("User_ID")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user authentication")
+            
+        logger.info(f"Retrieving forecasts for authenticated user_id: {user_id}")
+        
         if not client:
             raise HTTPException(status_code=500, detail="BigQuery client not initialized.")
         
@@ -105,12 +118,13 @@ async def get_saved_forecasts(
             Is_Active,
             Last_Updated
         FROM `capstone-henry.capstone_db.Forecasts`
-        WHERE 1=1
+        WHERE User_ID = @user_id
         """
+        
+        params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
+        
         if date:
             query += f" AND DATE(Forecast_Timestamp) = '{date}'"
-        if user_id is not None:
-            query += f" AND User_ID = {user_id}"
         if resolution is not None:
             query += f" AND Resolution_Minutes = {resolution}"
         if active_only:
@@ -118,7 +132,9 @@ async def get_saved_forecasts(
         
         query += f" ORDER BY Forecast_Timestamp DESC LIMIT {limit}"
         
-        query_job = client.query(query)
+        query_job = client.query(query, job_config=bigquery.QueryJobConfig(
+            query_parameters=params
+        ))
         results = list(query_job.result())
         
         forecasts = []
