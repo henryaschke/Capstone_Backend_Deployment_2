@@ -711,33 +711,32 @@ def get_performance_metrics(
     end_date: Optional[datetime] = None
 ) -> Dict[str, Any]:
     """
-    Example performance metrics aggregator that uses trades and portfolio data.
+    Calculate performance metrics from executed trades.
     """
     db = get_db()
     
-    # Calculate total revenue, profit, etc. from trades
+    # Calculate total revenue, profit, etc. from executed trades only
     trades_query = f"""
         SELECT 
-            SUM(CASE WHEN trade_type = 'sell' THEN quantity * trade_price ELSE 0 END) as total_revenue,
-            SUM(CASE WHEN trade_type = 'sell' THEN quantity * trade_price ELSE -quantity * trade_price END) as total_profit,
-            COUNT(*) as trade_count
+            SUM(CASE WHEN Trade_Type = 'sell' THEN Quantity * Trade_Price ELSE 0 END) as total_revenue,
+            SUM(CASE WHEN Trade_Type = 'sell' THEN Quantity * Trade_Price ELSE -Quantity * Trade_Price END) as total_profit,
+            COUNT(*) as trade_count,
+            SUM(Quantity) as total_volume
         FROM `{db.get_table_ref("Trades")}`
-        WHERE user_id = @user_id
+        WHERE User_ID = @user_id
+        AND Status = 'executed'
     """
     params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
     
     if start_date:
-        trades_query += " AND timestamp >= @start_date"
+        trades_query += " AND Timestamp >= @start_date"
         params.append(bigquery.ScalarQueryParameter("start_date", "TIMESTAMP", start_date))
     
     if end_date:
-        trades_query += " AND timestamp <= @end_date"
+        trades_query += " AND Timestamp <= @end_date"
         params.append(bigquery.ScalarQueryParameter("end_date", "TIMESTAMP", end_date))
     
     trades_results = db.execute_query(trades_query, params)
-    
-    # Also get portfolio data
-    portfolio = get_portfolio_by_user_id(user_id)
     
     # Combine the data
     metrics = {
@@ -745,10 +744,7 @@ def get_performance_metrics(
         "totalProfit": trades_results[0].get("total_profit", 0) if trades_results else 0,
         "totalCosts": 0,      # We'll derive below
         "profitMargin": 0,
-        "totalVolume": 0,     # We'll fetch from a separate query below
-        "accuracy": 92,       # Hard-coded example
-        "currentBalance": portfolio.get("Current_Balance", 0) if portfolio else 0,
-        "cumulativeProfitLoss": portfolio.get("Cumulative_Profit_Loss", 0) if portfolio else 0
+        "totalVolume": trades_results[0].get("total_volume", 0) if trades_results else 0
     }
     
     # totalCosts = totalRevenue - totalProfit
@@ -760,17 +756,6 @@ def get_performance_metrics(
     # Calculate profit margin
     if metrics["totalRevenue"] > 0:
         metrics["profitMargin"] = (metrics["totalProfit"] / metrics["totalRevenue"]) * 100
-    
-    # Get total volume from trades
-    volume_query = f"""
-        SELECT SUM(quantity) as total_volume
-        FROM `{db.get_table_ref("Trades")}`
-        WHERE user_id = @user_id
-    """
-    volume_results = db.execute_query(volume_query, params)
-    
-    if volume_results and volume_results[0].get("total_volume") is not None:
-        metrics["totalVolume"] = volume_results[0]["total_volume"]
     
     return metrics
 
