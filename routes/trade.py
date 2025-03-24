@@ -628,6 +628,16 @@ async def _process_trade_execution(trade_id: int):
         
         # Normalize execution time to handle timezone
         if execution_time:
+            # If execution_time is a string, parse it to datetime
+            if isinstance(execution_time, str):
+                try:
+                    # Try parsing with timezone info
+                    execution_time = datetime.fromisoformat(execution_time.replace('Z', '+00:00'))
+                except ValueError:
+                    # If parsing fails, assume UTC
+                    execution_time = datetime.fromisoformat(execution_time)
+                    execution_time = execution_time.replace(tzinfo=timezone.utc)
+            
             # If it has tzinfo, use it. Otherwise, assume UTC
             if hasattr(execution_time, 'tzinfo') and execution_time.tzinfo is not None:
                 # Convert to CET for delivery period calculation
