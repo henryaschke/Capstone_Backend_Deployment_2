@@ -719,7 +719,7 @@ def get_performance_metrics(
     trades_query = f"""
         SELECT 
             SUM(CASE WHEN Trade_Type = 'sell' THEN Quantity * Trade_Price ELSE 0 END) as total_revenue,
-            SUM(CASE WHEN Trade_Type = 'sell' THEN Quantity * Trade_Price ELSE -Quantity * Trade_Price END) as total_profit,
+            SUM(CASE WHEN Trade_Type = 'buy' THEN Quantity * Trade_Price ELSE 0 END) as total_costs,
             COUNT(*) as trade_count,
             SUM(Quantity) as total_volume
         FROM `{db.get_table_ref("Trades")}`
@@ -741,17 +741,15 @@ def get_performance_metrics(
     # Combine the data
     metrics = {
         "totalRevenue": trades_results[0].get("total_revenue", 0) if trades_results else 0,
-        "totalProfit": trades_results[0].get("total_profit", 0) if trades_results else 0,
-        "totalCosts": 0,      # We'll derive below
-        "profitMargin": 0,
-        "totalVolume": trades_results[0].get("total_volume", 0) if trades_results else 0
+        "totalCosts": trades_results[0].get("total_costs", 0) if trades_results else 0,
+        "totalProfit": 0,      # We'll derive below
+        "profitMargin": 0,     # We'll derive below
+        "totalVolume": trades_results[0].get("total_volume", 0) if trades_results else 0,
+        "trade_count": trades_results[0].get("trade_count", 0) if trades_results else 0
     }
     
-    # totalCosts = totalRevenue - totalProfit
-    if trades_results:
-        revenue = trades_results[0].get("total_revenue", 0) or 0
-        profit = trades_results[0].get("total_profit", 0) or 0
-        metrics["totalCosts"] = revenue - profit
+    # Calculate total profit (revenue - costs)
+    metrics["totalProfit"] = metrics["totalRevenue"] - metrics["totalCosts"]
     
     # Calculate profit margin
     if metrics["totalRevenue"] > 0:
