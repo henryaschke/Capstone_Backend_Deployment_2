@@ -30,7 +30,12 @@ async def get_performance_metrics_api(
         start_date_obj = parse_date_string(start_date)
         end_date_obj = parse_date_string(end_date)
         
+        # Log the date range for debugging
+        logger.info(f"Fetching metrics for date range: {start_date_obj} to {end_date_obj}")
+        
+        # Get metrics for executed trades
         metrics = get_performance_metrics(user_id, start_date_obj, end_date_obj)
+        logger.info(f"Got metrics from database: {metrics}")
         
         # Generate some dummy chart data for demonstration
         chart_data = []
@@ -44,6 +49,15 @@ async def get_performance_metrics_api(
             })
         metrics["chartData"] = sorted(chart_data, key=lambda x: x["date"])
         
+        # Add additional metadata to help with debugging
+        metrics["dateRange"] = {
+            "start": start_date,
+            "end": end_date,
+            "parsed_start": str(start_date_obj) if start_date_obj else None,
+            "parsed_end": str(end_date_obj) if end_date_obj else None
+        }
+        
+        logger.info(f"Returning metrics: {metrics}")
         return metrics
     except HTTPException:
         # Re-raise HTTP exceptions

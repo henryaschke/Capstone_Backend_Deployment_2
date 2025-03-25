@@ -34,9 +34,10 @@ CET = pytz.timezone('Europe/Berlin')
 def to_cet(dt):
     """Convert a datetime to CET timezone"""
     if dt.tzinfo is None:
-        # If naive datetime, assume it's UTC and add CET offset
-        return dt.replace(tzinfo=timezone.utc).astimezone(timezone(CET_OFFSET))
-    return dt.astimezone(timezone(CET_OFFSET))
+        # If naive datetime, assume it's UTC
+        return dt.replace(tzinfo=timezone.utc).astimezone(CET)
+    # If it has timezone info, properly convert it to CET
+    return dt.astimezone(CET)  # Use pytz for proper DST handling
 
 def from_cet(dt):
     """Convert a CET datetime to UTC"""
@@ -258,7 +259,14 @@ async def get_trade_history_api(
         # Filter by status if provided
         if status:
             logger.info(f"Filtering by status: {status}")
-            trades = [t for t in trades if t.get("status", "").lower() == status.lower()]
+            
+            # Add detailed logging of each trade's status
+            logger.info("Status values in all trades before filtering:")
+            for index, trade in enumerate(trades):
+                status_val = trade.get("status", trade.get("Status", "UNKNOWN"))
+                logger.info(f"Trade {index}: ID={trade.get('Trade_ID', 'N/A')}, Status={status_val}, Type={type(status_val)}")
+            
+            trades = [t for t in trades if t.get("status", "").lower() == status.lower() or t.get("Status", "").lower() == status.lower()]
             logger.info(f"After status filter: {len(trades)} trades")
         
         # Format the trades for the API response
@@ -272,7 +280,21 @@ async def get_trade_history_api(
             
             # Timestamp handling
             timestamp = t.get("timestamp", t.get("Timestamp", datetime.now()))
-            timestamp_iso = timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp
+            
+            # If timestamp is a datetime, ensure it's properly converted to CET before serialization
+            if isinstance(timestamp, datetime):
+                # If timestamp has no timezone info, assume it's UTC
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                # Convert to CET
+                timestamp_cet = timestamp.astimezone(CET)
+                # Format as ISO string with timezone info
+                timestamp_iso = timestamp_cet.isoformat()
+                logger.info(f"Converted timestamp from {timestamp} to CET: {timestamp_cet}")
+            else:
+                # It's already a string, leave as is
+                timestamp_iso = timestamp
+                logger.info(f"Using timestamp string as is: {timestamp_iso}")
             
             # Resolution
             resolution = t.get("resolution", t.get("Resolution", 15))
@@ -292,16 +314,28 @@ async def get_trade_history_api(
             
             logger.info(f"Processing trade: ID={trade_id}, Type={trade_type}, Quantity={quantity}, Price={trade_price}")
             
+            # Return field names that match the BigQuery schema to ensure the frontend can find them
             result.append({
+                "Trade_ID": trade_id,  # Keep the original field names
+                "Trade_Type": trade_type,
+                "Quantity": float(quantity) if quantity is not None else 0.0,
+                "Timestamp": timestamp_iso,
+                "Resolution": resolution,
+                "Status": status,
+                "Market": market,
+                "Created_At": created_at_iso,
+                "Trade_Price": float(trade_price) if trade_price is not None else 0.0,
+                
+                # Also include lowercase versions for backward compatibility
                 "trade_id": trade_id,
                 "type": trade_type.lower() if isinstance(trade_type, str) else trade_type,
-                "quantity": float(quantity) if quantity is not None else 0.0,  # Ensure quantity is a float
+                "quantity": float(quantity) if quantity is not None else 0.0,
                 "timestamp": timestamp_iso,
                 "resolution": resolution,
                 "status": status.lower() if isinstance(status, str) else status,
                 "market": market,
                 "created_at": created_at_iso,
-                "trade_price": float(trade_price) if trade_price is not None else 0.0  # Ensure price is a float
+                "trade_price": float(trade_price) if trade_price is not None else 0.0
             })
         format_time = (datetime.now() - format_start).total_seconds()
         
@@ -369,7 +403,37 @@ async def execute_pending_trade(
         result = await _process_trade_execution(trade_id)
         return result
     
-    except HTTPException as e:
+    except HTTPException as http_e:
+        # Check if this is a pending case we should preserve
+        is_pending_case = (
+            "not yet cleared" in str(http_e.detail) or  # Market price not cleared
+            "in the future" in str(http_e.detail) or    # Execution time in future
+            "Please try again later" in str(http_e.detail) or  # General retry message
+            "No market data" in str(http_e.detail)  # No market data available yet for the period
+        )
+        
+        if is_pending_case:
+            # For pending cases, update error message in database but keep status as pending
+            logger.info(f"Trade {trade_id} remains pending: {http_e.detail}")
+            
+            # Explicitly update the trade with pending status and error message
+            update_data = {
+                "Status": "pending",  # Explicitly set status to pending
+                "Error_Message": str(http_e.detail)
+            }
+            try:
+                update_trade_status(trade_id, update_data)
+            except Exception as update_error:
+                logger.error(f"Failed to update trade with error message: {update_error}")
+            
+            # Return a response indicating the trade remains pending with a reason
+            return {
+                "success": False,
+                "trade_id": trade_id,
+                "status": "pending",
+                "message": str(http_e.detail)
+            }
+        
         # Re-raise HTTP exceptions
         raise
     except Exception as e:
@@ -401,6 +465,7 @@ async def execute_all_pending_trades(
         # Process each trade
         results = []
         executed_count = 0
+        still_pending_count = 0
         failed_count = 0
         
         for trade in pending_trades:
@@ -412,19 +477,74 @@ async def execute_all_pending_trades(
                     "message": f"Successfully executed {trade.get('Trade_Type', trade.get('trade_type'))} trade"
                 })
                 executed_count += 1
+            except HTTPException as http_e:
+                trade_id = trade.get("Trade_ID", trade.get("trade_id"))
+                
+                # Check for various cases where we should keep the trade as pending
+                is_pending_case = (
+                    "not yet cleared" in str(http_e.detail) or  # Market price not cleared
+                    "in the future" in str(http_e.detail) or    # Execution time in future
+                    "Please try again later" in str(http_e.detail) or  # General retry message
+                    "No market data" in str(http_e.detail)  # No market data available yet for the period
+                )
+                
+                if is_pending_case:
+                    logger.info(f"Trade {trade_id} remains pending: {http_e.detail}")
+                    # Update the trade with error message but keep status as pending
+                    update_data = {
+                        "Status": "pending",  # Explicitly set status to pending
+                        "Error_Message": str(http_e.detail)
+                    }
+                    update_trade_status(trade_id, update_data)
+                    
+                    results.append({
+                        "trade_id": trade_id,
+                        "success": False,
+                        "status": "pending",
+                        "message": str(http_e.detail)
+                    })
+                    still_pending_count += 1
+                else:
+                    # For other HTTP exceptions, mark as failed
+                    logger.error(f"Error executing trade {trade_id}: {http_e.detail}")
+                    # Update the trade status to failed for other errors
+                    update_data = {
+                        "Status": "failed",
+                        "Error_Message": str(http_e.detail)
+                    }
+                    update_trade_status(trade_id, update_data)
+                    
+                    results.append({
+                        "trade_id": trade_id,
+                        "success": False,
+                        "status": "failed",
+                        "message": str(http_e.detail)
+                    })
+                    failed_count += 1
             except Exception as e:
-                logger.error(f"Error executing trade {trade.get('Trade_ID', trade.get('trade_id'))}: {e}")
+                trade_id = trade.get("Trade_ID", trade.get("trade_id"))
+                logger.error(f"Error executing trade {trade_id}: {e}")
+                
+                # Update the trade status to failed
+                update_data = {
+                    "Status": "failed",
+                    "Error_Message": str(e)
+                }
+                update_trade_status(trade_id, update_data)
+                
                 results.append({
-                    "trade_id": trade.get("Trade_ID", trade.get("trade_id")),
+                    "trade_id": trade_id,
                     "success": False,
+                    "status": "failed",
                     "message": str(e)
                 })
                 failed_count += 1
         
         return {
             "success": True,
-            "message": f"Processed {len(pending_trades)} pending trades. {executed_count} executed, {failed_count} failed.",
+            "message": f"Processed {len(pending_trades)} pending trades. {executed_count} executed, {still_pending_count} still pending (price not cleared or future execution time), {failed_count} failed.",
             "executed_count": executed_count,
+            "still_pending_count": still_pending_count,
             "failed_count": failed_count,
             "results": results
         }
@@ -626,112 +746,198 @@ async def _process_trade_execution(trade_id: int):
         # Get execution time (handle both camelCase and snake_case keys)
         execution_time = trade.get("Timestamp", trade.get("timestamp"))
         
+        # Check if the execution time is in the future - if so, keep the trade as pending
+        if execution_time:
+            # If execution_time is a string, parse it to datetime
+            if isinstance(execution_time, str):
+                try:
+                    execution_time = datetime.fromisoformat(execution_time.replace('Z', '+00:00'))
+                except ValueError:
+                    execution_time = datetime.fromisoformat(execution_time)
+                    execution_time = execution_time.replace(tzinfo=timezone.utc)
+            
+            # Compare with current time to see if the execution time is still in the future
+            now_utc = datetime.now(timezone.utc)
+            
+            # Add a small buffer (e.g., 1 minute) to account for slight clock differences
+            if execution_time > now_utc + timedelta(minutes=1):
+                future_minutes = (execution_time - now_utc).total_seconds() / 60
+                error_message = f"Trade scheduled for {execution_time.isoformat()} is {future_minutes:.1f} minutes in the future. Please try again later."
+                logger.info(f"Trade {trade_id} remains pending because execution time is in the future: {error_message}")
+                # Don't update status - keep it as pending
+                raise HTTPException(status_code=400, detail=error_message)
+        
         # Normalize execution time to handle timezone
         if execution_time:
+            # Log the original execution_time for debugging
+            logger.info(f"Raw execution time from database: {execution_time}, type: {type(execution_time)}")
+            
             # If execution_time is a string, parse it to datetime
             if isinstance(execution_time, str):
                 try:
                     # Try parsing with timezone info
                     execution_time = datetime.fromisoformat(execution_time.replace('Z', '+00:00'))
+                    logger.info(f"Parsed execution time with timezone: {execution_time}")
                 except ValueError:
-                    # If parsing fails, assume UTC
+                    # If parsing fails, assume it's UTC (BigQuery stores timestamps as UTC)
                     execution_time = datetime.fromisoformat(execution_time)
+                    # Explicitly add UTC timezone 
                     execution_time = execution_time.replace(tzinfo=timezone.utc)
+                    logger.info(f"Parsed execution time as UTC: {execution_time}")
             
-            # If it has tzinfo, use it. Otherwise, assume UTC
-            if hasattr(execution_time, 'tzinfo') and execution_time.tzinfo is not None:
-                # Convert to CET for delivery period calculation
-                execution_time_cet = to_cet(execution_time)
-                logger.info(f"Execution time with timezone: {execution_time}, CET: {execution_time_cet}")
-            else:
-                # Assume the naive datetime is in UTC, convert to CET
-                execution_time_utc = execution_time.replace(tzinfo=timezone.utc)
-                execution_time_cet = to_cet(execution_time_utc)
-                logger.info(f"Execution time without timezone (assuming UTC): {execution_time}, CET: {execution_time_cet}")
+            # Now explicitly convert to CET timezone 
+            execution_time_cet = execution_time.astimezone(CET)
+            logger.info(f"Converted to CET: {execution_time} → {execution_time_cet}")
             
             # Calculate delivery period based on CET time
-            delivery_period = execution_time_cet.hour + 1  # Delivery periods are 1-24 for the hours 0-23 in CET
+            delivery_hour = execution_time_cet.hour
+            delivery_minute = execution_time_cet.minute
             delivery_day = execution_time_cet.strftime("%Y-%m-%d")
+            
+            logger.info(f"Using delivery hour: {delivery_hour}, minute: {delivery_minute} for period calculation")
+            
+            # Format the delivery period string based on resolution
+            if resolution == 15:
+                # For 15-minute resolution, format like "12:15 - 12:30"
+                start_minute = (delivery_minute // 15) * 15  # Round down to nearest 15
+                end_minute = (start_minute + 15) % 60
+                end_hour = delivery_hour + (1 if end_minute == 0 else 0)
+                delivery_period = f"{delivery_hour:02d}:{start_minute:02d} - {end_hour:02d}:{end_minute:02d}"
+            elif resolution == 30:
+                # For 30-minute resolution, format like "12:00 - 12:30" or "12:30 - 13:00"
+                start_minute = (delivery_minute // 30) * 30  # Either 0 or 30
+                end_minute = (start_minute + 30) % 60
+                end_hour = delivery_hour + (1 if end_minute == 0 else 0)
+                delivery_period = f"{delivery_hour:02d}:{start_minute:02d} - {end_hour:02d}:{end_minute:02d}"
+            elif resolution == 60:
+                # For 60-minute resolution, format like "12:00 - 13:00"
+                delivery_period = f"{delivery_hour:02d}:00 - {(delivery_hour + 1):02d}:00"
+            else:
+                # Default fallback for unexpected resolution
+                delivery_period = str(delivery_hour + 1)  # Legacy format
+                
+            logger.info(f"Calculated delivery period: '{delivery_period}' for time {execution_time_cet} with resolution {resolution}")
         else:
             # If we don't have execution time, use current hour in CET
             now_cet = to_cet(datetime.now(timezone.utc))
-            delivery_period = now_cet.hour + 1
+            delivery_hour = now_cet.hour
+            delivery_minute = now_cet.minute
             delivery_day = now_cet.strftime("%Y-%m-%d")
+            
+            # Use the same logic as above to determine delivery period
+            if resolution == 15:
+                start_minute = (delivery_minute // 15) * 15
+                end_minute = (start_minute + 15) % 60
+                end_hour = delivery_hour + (1 if end_minute == 0 else 0)
+                delivery_period = f"{delivery_hour:02d}:{start_minute:02d} - {end_hour:02d}:{end_minute:02d}"
+            elif resolution == 30:
+                start_minute = (delivery_minute // 30) * 30
+                end_minute = (start_minute + 30) % 60
+                end_hour = delivery_hour + (1 if end_minute == 0 else 0)
+                delivery_period = f"{delivery_hour:02d}:{start_minute:02d} - {end_hour:02d}:{end_minute:02d}"
+            elif resolution == 60:
+                delivery_period = f"{delivery_hour:02d}:00 - {(delivery_hour + 1):02d}:00"
+            else:
+                delivery_period = str(delivery_hour + 1)
         
         logger.info(f"Trade execution time (CET): {execution_time_cet if 'execution_time_cet' in locals() else 'N/A'}, delivery day: {delivery_day}, delivery period: {delivery_period}")
         
-        # 2. Check market data to see if the product is cleared
-        market_data = get_market_data_today(delivery_period, resolution)
+        # 2. First check Market_Data_Germany_Today for current data
+        db = get_db()
         
-        if not market_data:
-            # No market data found - create mock data for testing
-            logger.warning(f"No market data found for delivery period {delivery_period} - using mock data for testing")
-            # Mock data will be created by get_market_data_today automatically
-            market_data = get_market_data_today(delivery_period, resolution)
+        # Build direct query for Market_Data_Germany_Today with precise delivery period
+        today_query = f"""
+            SELECT *
+            FROM `{PROJECT_ID}.{DATASET_ID}.Market_Data_Germany_Today`
+            WHERE Delivery_Day = @delivery_day
+            AND Delivery_Period = @delivery_period
+            AND Resolution_Minutes = @resolution
+            AND Cleared = TRUE
+        """
         
-        if not market_data:
-            # If still no data after mock attempt
-            error_message = f"No market data found for delivery period {delivery_period} with resolution {resolution}"
-            update_data = {
-                "Status": "failed",
-                "Error_Message": error_message
-            }
-            update_trade_status(trade_id, update_data)
-            raise HTTPException(status_code=400, detail=error_message)
+        today_params = [
+            bigquery.ScalarQueryParameter("delivery_day", "STRING", delivery_day),
+            bigquery.ScalarQueryParameter("delivery_period", "STRING", delivery_period),
+            bigquery.ScalarQueryParameter("resolution", "INTEGER", resolution)
+        ]
         
-        # Get the corresponding market record for the correct resolution and period
+        logger.info(f"Querying Market_Data_Germany_Today with: day={delivery_day}, period='{delivery_period}', resolution={resolution}")
+        market_data_today = db.execute_query(today_query, today_params)
+        
+        # If not found in today's data, check historical data
         market_record = None
-        for record in market_data:
-            # Check if the record matches our resolution (try both naming conventions)
-            if (record.get("Resolution_Minutes") == resolution or 
-                record.get("resolution") == resolution or 
-                record.get("ResolutionMinutes") == resolution):
-                market_record = record
-                break
-                
+        if market_data_today and len(market_data_today) > 0:
+            logger.info(f"Found {len(market_data_today)} matching records in Market_Data_Germany_Today")
+            market_record = market_data_today[0]
+            data_source = "Market_Data_Germany_Today"
+        else:
+            logger.info("No matching cleared data found in Market_Data_Germany_Today, checking Market_Data_Germany")
+            
+            # Build query for historical data
+            historical_query = f"""
+                SELECT *
+                FROM `{PROJECT_ID}.{DATASET_ID}.Market_Data_Germany`
+                WHERE Delivery_Day = @delivery_day
+                AND Delivery_Period = @delivery_period
+                AND Resolution_Minutes = @resolution
+            """
+            
+            historical_params = [
+                bigquery.ScalarQueryParameter("delivery_day", "STRING", delivery_day),
+                bigquery.ScalarQueryParameter("delivery_period", "STRING", delivery_period),
+                bigquery.ScalarQueryParameter("resolution", "INTEGER", resolution)
+            ]
+            
+            logger.info(f"Querying Market_Data_Germany with: day={delivery_day}, period='{delivery_period}', resolution={resolution}")
+            market_data_historical = db.execute_query(historical_query, historical_params)
+            
+            if market_data_historical and len(market_data_historical) > 0:
+                logger.info(f"Found {len(market_data_historical)} matching records in Market_Data_Germany")
+                market_record = market_data_historical[0]
+                data_source = "Market_Data_Germany"
+            else:
+                logger.info("No matching data found in Market_Data_Germany either")
+        
+        # If still no market data found
         if not market_record:
-            # If we don't have exact resolution match, take the first record
-            market_record = market_data[0]
-        
-        # For testing, always consider the market cleared (try both naming conventions)
-        is_cleared = False
-        for cleared_field in ["Cleared", "IsCleared", "is_cleared"]:
-            if cleared_field in market_record:
-                is_cleared = market_record[cleared_field]
-                if is_cleared:
-                    break
-        
-        # Default to True for testing if we couldn't find a cleared flag
-        if not isinstance(is_cleared, bool):
-            is_cleared = True
-        
-        if not is_cleared:
-            # Product is not yet cleared in the market
-            error_message = f"Market for delivery period {delivery_period} is not yet cleared"
-            update_data = {
-                "Status": "failed",
-                "Error_Message": error_message
-            }
-            update_trade_status(trade_id, update_data)
+            error_message = f"No market data available yet for delivery day {delivery_day}, period '{delivery_period}' with resolution {resolution} minutes. The trade will remain pending until data becomes available."
+            logger.error(error_message)
+            # Keep as pending - don't update status
             raise HTTPException(status_code=400, detail=error_message)
         
-        # 3. Get the clearing price from market data (try different field names)
-        trade_price = None
-        for price_field in ["clearing_price", "Close", "close", "VWAP", "vwap"]:
-            if price_field in market_record and market_record[price_field] is not None:
-                trade_price = float(market_record[price_field])
-                break
+        # Check if the market is cleared (only relevant for today's data, historical is assumed cleared)
+        is_cleared = True
+        if data_source == "Market_Data_Germany_Today":
+            is_cleared = market_record.get("Cleared", False)
+            
+        if not is_cleared:
+            error_message = f"The market price for Trade {trade_id} at delivery period '{delivery_period}' with resolution {resolution} minutes is not yet cleared. Please wait for the market to clear or try again later."
+            logger.info(f"Trade {trade_id} remains pending because market price is not yet cleared")
+            # Keep as pending - don't update status
+            raise HTTPException(status_code=400, detail=error_message)
+        
+        # Select appropriate price based on trade type
+        if trade_type == "buy":
+            # For buy, use the low price to get the best deal
+            trade_price = market_record.get("Low")
+            price_field = "Low"
+        else:  # sell
+            # For sell, use the high price for maximum revenue
+            trade_price = market_record.get("High")
+            price_field = "High"
+        
+        # Log the market record for debugging
+        logger.info(f"Using {price_field} price from {data_source} for {trade_type} trade: " + 
+                  f"Low={market_record.get('Low')}, High={market_record.get('High')}, " +
+                  f"VWAP={market_record.get('VWAP')}, Close={market_record.get('Close')}")
         
         if trade_price is None:
-            error_message = f"No price data available for period {delivery_period}"
-            update_data = {
-                "Status": "failed",
-                "Error_Message": error_message
-            }
-            update_trade_status(trade_id, update_data)
+            error_message = f"No {price_field} price available for period '{delivery_period}' with resolution {resolution} minutes"
+            logger.error(error_message)
+            # Keep as pending - don't update status
             raise HTTPException(status_code=400, detail=error_message)
         
-        logger.info(f"Found market price: {trade_price} for period {delivery_period}, resolution {resolution}")
+        logger.info(f"Found market price: {trade_price} ({price_field}) for period '{delivery_period}', resolution {resolution}")
         
         # 4. Get battery status
         battery = get_battery_status(user_id)
@@ -894,7 +1100,20 @@ async def _process_trade_execution(trade_id: int):
             "profit_loss": trade_pnl
         }
     
-    except HTTPException:
+    except HTTPException as http_e:
+        # Check if this is a pending case we should preserve
+        is_pending_case = (
+            "not yet cleared" in str(http_e.detail) or  # Market price not cleared
+            "in the future" in str(http_e.detail) or    # Execution time in future
+            "Please try again later" in str(http_e.detail) or  # General retry message
+            "No market data" in str(http_e.detail)  # No market data available yet for the period
+        )
+        
+        if is_pending_case:
+            # For pending cases, update error message in database but keep status as pending
+            # The actual update happens in the caller functions that catch this exception
+            logger.info(f"Trade {trade_id} remains pending: {http_e.detail}")
+        
         # Re-raise HTTP exceptions
         raise
     except Exception as e:

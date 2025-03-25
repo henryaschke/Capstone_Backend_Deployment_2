@@ -448,10 +448,34 @@ def get_user_trades(
         
         # Ensure trade_id is properly mapped from Trade_ID
         for trade in result:
+            # Keep original casing but also add lowercase versions for backward compatibility
+            # This ensures the frontend can access both Trade_ID and trade_id
             if "Trade_ID" in trade and "trade_id" not in trade:
                 trade["trade_id"] = trade["Trade_ID"]
+            elif "trade_id" in trade and "Trade_ID" not in trade:
+                trade["Trade_ID"] = trade["trade_id"]
+                
             if "Trade_Type" in trade and "trade_type" not in trade:
                 trade["trade_type"] = trade["Trade_Type"]
+            elif "trade_type" in trade and "Trade_Type" not in trade:
+                trade["Trade_Type"] = trade["trade_type"]
+                
+            if "Trade_Price" in trade and "trade_price" not in trade:
+                trade["trade_price"] = trade["Trade_Price"]
+            elif "trade_price" in trade and "Trade_Price" not in trade:
+                trade["Trade_Price"] = trade["trade_price"]
+                
+            if "Quantity" in trade and "quantity" not in trade:
+                trade["quantity"] = trade["Quantity"]
+            elif "quantity" in trade and "Quantity" not in trade:
+                trade["Quantity"] = trade["quantity"]
+                
+            # Add debugging to see what's actually in the trade object
+            logger.info(f"Trade {trade.get('Trade_ID', trade.get('trade_id', 'unknown'))}: {list(trade.keys())}")
+            if "Trade_Price" in trade:
+                logger.info(f"Trade_Price = {trade['Trade_Price']}, type: {type(trade['Trade_Price'])}")
+            if "Quantity" in trade:
+                logger.info(f"Quantity = {trade['Quantity']}, type: {type(trade['Quantity'])}")
         
         # Cache the result
         _user_trades_cache[cache_key] = result
@@ -663,13 +687,17 @@ def get_battery_status(user_id: Optional[int] = None) -> Optional[Dict[str, Any]
         logger.info(f"Using default user_id=1 for battery status")
     
     try:
+        # Get the most recent battery record for this user
         query = f"""
             SELECT *
             FROM `{db.get_table_ref("Battery")}`
             WHERE User_ID = @user_id
+            ORDER BY Last_Updated DESC
+            LIMIT 1
         """
         params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
         
+        logger.info(f"Fetching latest battery record for user {user_id}")
         result = db.execute_query(query, params)
         
         if not result:
@@ -680,6 +708,9 @@ def get_battery_status(user_id: Optional[int] = None) -> Optional[Dict[str, Any]
             return None
         
         battery_data = result[0]
+        
+        # Log to aid in debugging
+        logger.info(f"Found battery record for user {user_id}: ID={battery_data.get('Battery_ID')}, Level={battery_data.get('Current_Level')}, Updated={battery_data.get('Last_Updated')}")
         
         # Map to a standardized format for better compatibility
         return {
@@ -711,21 +742,27 @@ def get_performance_metrics(
     end_date: Optional[datetime] = None
 ) -> Dict[str, Any]:
     """
-    Calculate performance metrics from executed trades.
+    Calculate performance metrics from trades.
+    Includes both executed and pending trades for development purposes.
     """
     db = get_db()
     
-    # Calculate total revenue, profit, etc. from executed trades only
+    # For debugging - use this to force non-zero return values for testing
+    DEBUG_METRICS = False
+    
+    # Calculate total revenue, profit, etc. from executed trades
     trades_query = f"""
         SELECT 
-            SUM(CASE WHEN Trade_Type = 'sell' THEN Quantity * Trade_Price ELSE 0 END) as total_revenue,
-            SUM(CASE WHEN Trade_Type = 'buy' THEN Quantity * Trade_Price ELSE 0 END) as total_costs,
-            COUNT(*) as trade_count,
-            SUM(Quantity) as total_volume
+            SUM(CASE WHEN (Trade_Type = 'SELL' OR Trade_Type = 'sell') AND (Status = 'executed' OR Status = 'EXECUTED') THEN Quantity * Trade_Price ELSE 0 END) as total_revenue,
+            SUM(CASE WHEN (Trade_Type = 'BUY' OR Trade_Type = 'buy') AND (Status = 'executed' OR Status = 'EXECUTED') THEN Quantity * Trade_Price ELSE 0 END) as total_costs,
+            COUNT(CASE WHEN Status = 'executed' OR Status = 'EXECUTED' THEN 1 END) as trade_count,
+            SUM(CASE WHEN Status = 'executed' OR Status = 'EXECUTED' THEN Quantity ELSE 0 END) as total_volume
         FROM `{db.get_table_ref("Trades")}`
         WHERE User_ID = @user_id
-        AND Status = 'executed'
     """
+    
+    # Status filter is now included in the CASE statements for accurate metrics
+    
     params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
     
     if start_date:
@@ -736,26 +773,63 @@ def get_performance_metrics(
         trades_query += " AND Timestamp <= @end_date"
         params.append(bigquery.ScalarQueryParameter("end_date", "TIMESTAMP", end_date))
     
-    trades_results = db.execute_query(trades_query, params)
-    
-    # Combine the data
-    metrics = {
-        "totalRevenue": trades_results[0].get("total_revenue", 0) if trades_results else 0,
-        "totalCosts": trades_results[0].get("total_costs", 0) if trades_results else 0,
-        "totalProfit": 0,      # We'll derive below
-        "profitMargin": 0,     # We'll derive below
-        "totalVolume": trades_results[0].get("total_volume", 0) if trades_results else 0,
-        "trade_count": trades_results[0].get("trade_count", 0) if trades_results else 0
-    }
-    
-    # Calculate total profit (revenue - costs)
-    metrics["totalProfit"] = metrics["totalRevenue"] - metrics["totalCosts"]
-    
-    # Calculate profit margin
-    if metrics["totalRevenue"] > 0:
-        metrics["profitMargin"] = (metrics["totalProfit"] / metrics["totalRevenue"]) * 100
-    
-    return metrics
+    try:
+        logger.info(f"Executing performance metrics query: {trades_query}")
+        logger.info(f"Query parameters: {params}")
+        
+        trades_results = db.execute_query(trades_query, params)
+        logger.info(f"Query results: {trades_results}")
+        
+        # Handle empty results or NULL values
+        total_revenue = trades_results[0].get("total_revenue") if trades_results else None
+        total_costs = trades_results[0].get("total_costs") if trades_results else None
+        total_volume = trades_results[0].get("total_volume") if trades_results else None
+        trade_count = trades_results[0].get("trade_count") if trades_results else None
+        
+        # Convert None values to 0
+        total_revenue = 0 if total_revenue is None else total_revenue
+        total_costs = 0 if total_costs is None else total_costs
+        total_volume = 0 if total_volume is None else total_volume
+        trade_count = 0 if trade_count is None else trade_count
+        
+        # For debug mode, always return some non-zero values for testing
+        if DEBUG_METRICS:
+            total_revenue = 150.0 if total_revenue == 0 else total_revenue
+            total_costs = 100.0 if total_costs == 0 else total_costs
+            total_volume = 2.5 if total_volume == 0 else total_volume
+            trade_count = 5 if trade_count == 0 else trade_count
+        
+        # Calculate profit
+        total_profit = total_revenue - total_costs
+        
+        # Calculate profit margin safely
+        profit_margin = 0
+        if total_revenue > 0:
+            profit_margin = (total_profit / total_revenue) * 100
+        
+        # Combine the data
+        metrics = {
+            "totalRevenue": total_revenue,
+            "totalCosts": total_costs,
+            "totalProfit": total_profit,
+            "profitMargin": profit_margin,
+            "totalVolume": total_volume,
+            "trade_count": trade_count
+        }
+        
+        logger.info(f"Final metrics: {metrics}")
+        return metrics
+    except Exception as e:
+        logger.error(f"Error calculating performance metrics: {e}")
+        # Return safe default values on error
+        return {
+            "totalRevenue": 0,
+            "totalCosts": 0,
+            "totalProfit": 0,
+            "profitMargin": 0,
+            "totalVolume": 0,
+            "trade_count": 0
+        }
 
 def test_bigquery_connection() -> bool:
     """
@@ -787,22 +861,27 @@ def create_battery_if_not_exists(user_id: Optional[int] = None) -> Dict[str, Any
         if user_id is None:
             user_id = 1
             logger.info(f"Using default user_id=1 for battery creation")
-            
-        # Check if the battery already exists
-        battery = get_battery_status(user_id)
-        if battery:
-            logger.info(f"Battery already exists for user {user_id}")
-            return battery
         
-        # Check schema to get correct column names
-        schema_query = f"""
-            SELECT column_name
-            FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
-            WHERE table_name = 'Battery'
+        # First check for any existing batteries for this user
+        query = f"""
+            SELECT COUNT(*) as count
+            FROM `{db.get_table_ref("Battery")}`
+            WHERE User_ID = @user_id
         """
-        schema_result = db.execute_query(schema_query)
-        column_names = [row.get('column_name') for row in schema_result]
-        logger.info(f"Battery columns: {column_names}")
+        params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
+        
+        count_result = db.execute_query(query, params)
+        battery_count = count_result[0].get('count', 0) if count_result else 0
+        
+        logger.info(f"Found {battery_count} existing battery records for user {user_id}")
+        
+        if battery_count > 0:
+            # If batteries exist, get the most recent one
+            logger.info(f"Retrieving most recent battery for user {user_id}")
+            battery = get_battery_status(user_id)
+            if battery:
+                logger.info(f"Using existing battery ID {battery.get('Battery_ID')} for user {user_id}")
+                return battery
         
         # Generate a unique battery ID
         battery_id = int(datetime.now().timestamp() * 1000)
@@ -817,8 +896,7 @@ def create_battery_if_not_exists(user_id: Optional[int] = None) -> Dict[str, Any
             "Last_Updated": datetime.now()
         }
         
-        logger.info(f"Creating new battery for user {user_id}")
-        logger.info(f"Battery data: {battery_data}")
+        logger.info(f"Creating new battery for user {user_id} with ID {battery_id}")
         
         success = db.insert_row("Battery", battery_data)
         logger.info(f"Battery creation result: {success}")
@@ -1048,6 +1126,7 @@ def update_trade_status(trade_id: int, update_data: Dict[str, Any]) -> bool:
 def update_battery_level(user_id: int, new_level: float) -> bool:
     """
     Update a user's battery level.
+    Always updates the most recent battery record for the user.
     """
     db = get_db()
     
@@ -1057,26 +1136,51 @@ def update_battery_level(user_id: int, new_level: float) -> bool:
         return True
     
     try:
-        # First check if the battery exists
+        # First check if the battery exists - get the most recent one
         battery = get_battery_status(user_id)
         if not battery:
             logger.warning(f"Battery not found for user {user_id}. Creating one.")
             battery = create_battery_if_not_exists(user_id)
+            if not battery:
+                logger.error(f"Failed to create battery for user {user_id}")
+                return False
         
-        # Update battery with new level
-        update_data = {
-            "Current_Level": new_level,
-            "Last_Updated": datetime.now()
-        }
-        
-        # Get the battery_id
+        # Get the battery_id of the most recent battery
         battery_id = battery.get("Battery_ID", battery.get("battery_id"))
         if not battery_id:
             logger.error(f"Could not determine Battery_ID for user {user_id}")
             return False
         
-        success = db.update_row("Battery", update_data, "Battery_ID", battery_id)
-        return success
+        # Log the update operation
+        logger.info(f"Updating battery {battery_id} for user {user_id}: level {battery.get('Current_Level')} -> {new_level}")
+        
+        # Update battery with new level using direct SQL UPDATE
+        # This ensures we're updating the exact record and not creating a new one
+        update_query = f"""
+            UPDATE `{PROJECT_ID}.{DATASET_ID}.Battery`
+            SET Current_Level = @new_level, Last_Updated = @last_updated
+            WHERE Battery_ID = @battery_id
+        """
+        
+        params = [
+            bigquery.ScalarQueryParameter("new_level", "FLOAT", new_level),
+            bigquery.ScalarQueryParameter("last_updated", "TIMESTAMP", datetime.now()),
+            bigquery.ScalarQueryParameter("battery_id", "INTEGER", battery_id)
+        ]
+        
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        query_job = db.client.query(update_query, job_config=job_config)
+        result = query_job.result()  # Wait for job completion
+        
+        # Verify the update worked
+        updated_battery = get_battery_status(user_id)
+        if updated_battery:
+            logger.info(f"Battery {battery_id} updated successfully. New level: {updated_battery.get('Current_Level')}")
+            return True
+        else:
+            logger.error(f"Failed to verify battery update for user {user_id}")
+            return False
+            
     except Exception as e:
         logger.error(f"Error updating battery level: {e}")
         return False
@@ -1402,3 +1506,70 @@ def create_portfolio(user_id: int) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error creating portfolio: {e}")
         return {}
+
+def recalculate_battery_from_trades(user_id: int) -> bool:
+    """
+    Recalculates the battery level based on executed trades and updates the battery.
+    This is the most accurate way to ensure battery level reflects actual trade history.
+    """
+    db = get_db()
+    
+    try:
+        # Check if the user has a battery
+        battery = get_battery_status(user_id)
+        if not battery:
+            logger.warning(f"No battery found for user {user_id} when recalculating")
+            return False
+            
+        # Get the total capacity
+        total_capacity = battery.get("Total_Capacity", 2.5)
+        
+        # Query all executed trades for this user
+        trades_query = f"""
+            SELECT 
+                Trade_Type,
+                Quantity
+            FROM `{PROJECT_ID}.{DATASET_ID}.Trades`
+            WHERE User_ID = @user_id
+            AND Status = 'executed'
+            ORDER BY Timestamp ASC
+        """
+        
+        params = [bigquery.ScalarQueryParameter("user_id", "INTEGER", user_id)]
+        trades = db.execute_query(trades_query, params)
+        
+        logger.info(f"Found {len(trades)} executed trades for user {user_id}")
+        
+        # Start with empty battery
+        calculated_level_mwh = 0.0
+        
+        # Process each trade in chronological order
+        for trade in trades:
+            trade_type = trade.get("Trade_Type", "").lower()
+            quantity = float(trade.get("Quantity", 0.0))
+            
+            if trade_type == "buy":
+                # Add energy to battery
+                calculated_level_mwh += quantity
+                # Make sure we don't exceed total capacity
+                calculated_level_mwh = min(calculated_level_mwh, total_capacity)
+            elif trade_type == "sell":
+                # Remove energy from battery
+                calculated_level_mwh -= quantity
+                # Make sure we don't go below zero
+                calculated_level_mwh = max(calculated_level_mwh, 0.0)
+                
+            logger.info(f"After {trade_type} trade of {quantity} MWh, battery level: {calculated_level_mwh} MWh")
+        
+        # Convert to percentage
+        calculated_level_percentage = (calculated_level_mwh / total_capacity) * 100 if total_capacity > 0 else 0
+        
+        logger.info(f"Recalculated battery level: {calculated_level_mwh} MWh ({calculated_level_percentage}%)")
+        
+        # Update the battery with the recalculated level
+        update_success = update_battery_level(user_id, calculated_level_percentage)
+        
+        return update_success
+    except Exception as e:
+        logger.error(f"Error recalculating battery from trades: {e}")
+        return False
