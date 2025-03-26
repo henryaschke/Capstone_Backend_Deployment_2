@@ -1,55 +1,115 @@
-# Energy Trading Platform API
+# Energy Trading Platform Backend
 
-This is a restructured version of the original backend with better organization and modularity.
+A robust backend service for an energy trading platform that provides real-time market data, battery management, trading capabilities, and price forecasting.
 
-## Project Structure
+## Features
 
+- 🔐 **Authentication & Authorization**
+  - User registration and login
+  - JWT-based authentication
+  - Role-based access control
+
+- 📊 **Market Data Management**
+  - Real-time market data retrieval
+  - Historical data analysis
+  - Multi-market support (e.g., Germany)
+
+- 🔋 **Battery Management**
+  - Real-time battery status monitoring
+  - Capacity tracking
+  - Usage optimization
+
+- 📈 **Price Forecasting**
+  - Advanced price prediction models
+  - Multiple time resolutions (15min, 30min, 60min)
+  - Model performance tracking
+
+- 💹 **Trading System**
+  - Automated trading capabilities
+  - Trade execution and management
+  - Performance tracking and analytics
+
+- 📊 **Performance Analytics**
+  - Revenue and profit tracking
+  - Trading performance metrics
+  - Historical performance analysis
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/register` - Register new user
+- `POST /api/auth/login` - User login
+- `POST /api/auth/refresh` - Refresh authentication token
+- `GET /api/auth/me` - Get current user info
+
+### Battery Management
+- `GET /api/battery/status` - Get battery status and capacity
+
+### Market Data
+- `GET /api/market-data` - Get market data for specific date and market
+- `GET /api/market/status` - Get market status and configuration
+
+### Forecasting
+- `GET/POST /api/forecast/generate` - Generate price forecasts
+- `GET /api/forecast/status` - Get forecasting system status
+
+### Trading
+- `POST /api/trade/execute` - Execute trades
+- `GET /api/trade/history` - Get trading history
+- `GET /api/trade/status` - Get trading system status
+
+### Performance
+- `GET /api/performance/metrics` - Get performance metrics
+- `GET /api/performance/analytics` - Get detailed analytics
+
+### System Status
+- `GET /api/status` - Get API and system status
+- `GET /api/diagnostic/query` - Execute diagnostic queries
+
+## Setup & Installation
+
+1. Clone the repository
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Set up environment variables:
+   ```bash
+   cp .env.example .env
+   # Edit .env with your configuration
+   ```
+4. Run the server:
+   ```bash
+   python server.py
+   ```
+
+## Docker Deployment
+
+Build and run using Docker:
+```bash
+docker build -t energy-trading-backend .
+docker run -p 5000:5000 energy-trading-backend
 ```
-backend_new/
-├── server.py                  # Main entry point
-├── database.py                # Database interactions 
-├── forecasting.py             # Forecasting algorithms
-├── dependencies.py            # Shared dependencies
-├── models/                    # Pydantic models
-│   ├── __init__.py
-│   ├── auth.py                # Auth-related models
-│   ├── battery.py             # Battery-related models
-│   ├── forecast.py            # Forecast-related models
-│   ├── market.py              # Market-related models
-│   └── trade.py               # Trade-related models
-├── utils/                     # Utility functions
-│   ├── __init__.py
-│   └── helpers.py             # Common helper functions
-└── routes/                    # API endpoints by feature
-    ├── __init__.py
-    ├── auth.py                # Authentication routes
-    ├── battery.py             # Battery management routes
-    ├── forecast.py            # Forecasting routes
-    ├── market.py              # Market data routes
-    ├── performance.py         # Performance metrics routes
-    ├── status.py              # Diagnostic & status routes
-    └── trade.py               # Trading operations routes
+
+## Development
+
+- Python 3.8+
+- Flask framework
+- SQLAlchemy ORM
+- JWT authentication
+- BigQuery integration
+
+## Testing
+
+Run tests using:
+```bash
+python -m pytest
 ```
 
-## Key Features
+## Documentation
 
-- Modular design with separated concerns
-- Organized by feature area
-- Better maintainability and testability
-- Shared dependencies in a central location
-- Utility functions for common tasks
+Detailed API documentation is available at `/api/docs` when running the server.
 
-## Running the Application
+## License
 
-```
-python server.py
-```
-
-This will start the FastAPI server on port 8000.
-
-## API Documentation
-
-Once the server is running, you can access the auto-generated API documentation at:
-
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc 
+MIT License - See LICENSE file for details 
